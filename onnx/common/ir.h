@@ -199,6 +199,15 @@ struct Attributes {
       names.push_back(a->name);
     return names;
   }
+  // Like attributeNames() followed by kindOf() on each, but without
+  // allocating a names vector -- for callers (e.g. Graph's subgraph walk)
+  // that just need to visit every (name, kind) pair on a hot path.
+  template <typename Fn>
+  void forEachAttributeNameAndKind(const Fn& fn) const {
+    for (const auto& a : values_) {
+      fn(a->name, a->kind());
+    }
+  }
 
 #define CREATE_ACCESSOR(Kind, method)                                           \
   Derived* method##_(Symbol name, Kind##Attr::ConstructorType v) {              \
@@ -936,26 +945,36 @@ struct Graph final {
     }
     // Still O(n) over this graph's nodes to find any subgraph (If/Loop/Scan
     // body) to recurse into, but each iteration is now just a cheap
-    // attribute-kind check -- no string comparisons -- since the name-bearing
-    // checks above already ruled out this graph's own names.
+    // attribute-kind check -- no string comparisons, no attributeNames()
+    // allocation -- since the name-bearing checks above already ruled out
+    // this graph's own names.
+    bool conflict = false;
     for (const auto& node_entry : all_nodes) {
+      if (conflict) {
+        break;
+      }
       const Node* node = node_entry.first;
-      for (const auto& attr : node->attributeNames()) {
-        if (node->kindOf(attr) == AttributeKind::g) {
-          const auto& subgraph = node->g(attr);
-          if (!subgraph->isNameUnique(name)) {
-            return false;
+      node->forEachAttributeNameAndKind([&](Symbol attr, AttributeKind kind) {
+        if (conflict) {
+          return;
+        }
+        if (kind == AttributeKind::g) {
+          if (!node->g(attr)->isNameUnique(name)) {
+            conflict = true;
           }
-        } else if (node->kindOf(attr) == AttributeKind::gs) {
+        } else if (kind == AttributeKind::gs) {
           for (const auto& subgraph : node->gs(attr)) {
+            if (conflict) {
+              break;
+            }
             if (!subgraph->isNameUnique(name)) {
-              return false;
+              conflict = true;
             }
           }
         }
-      }
+      });
     }
-    return true;
+    return !conflict;
   }
 
  public:
@@ -1236,15 +1255,20 @@ struct Graph final {
     fn(self);
     for (const auto& node_entry : self->all_nodes) {
       const Node* node = node_entry.first;
-      for (const auto& attr : node->attributeNames()) {
-        if (node->kindOf(attr) == AttributeKind::g) {
+      // forEachAttributeNameAndKind(), not attributeNames() + kindOf(): this
+      // runs for every node on every forEachNode() call (e.g. once per
+      // Value::replaceAllUsesWith(), a hot path during rewriting), and
+      // attributeNames() would heap-allocate a vector per node just to find
+      // the (usually zero) g/gs-kind ones.
+      node->forEachAttributeNameAndKind([&](Symbol attr, AttributeKind kind) {
+        if (kind == AttributeKind::g) {
           forSelfAndEachSubGraphImpl(node->g(attr).get(), fn);
-        } else if (node->kindOf(attr) == AttributeKind::gs) {
+        } else if (kind == AttributeKind::gs) {
           for (const auto& subgraph : node->gs(attr)) {
             forSelfAndEachSubGraphImpl(subgraph.get(), fn);
           }
         }
-      }
+      });
     }
   }
 
