@@ -177,6 +177,7 @@ struct Attributes {
     for (const auto& i : rhs.values_) {
       values_.push_back(i->clone());
     }
+    This()->onAttributesChanged();
   }
   bool hasAttribute(Symbol name) const {
     return find(name, false) != values_.end();
@@ -186,6 +187,7 @@ struct Attributes {
   }
   Derived* removeAttribute(Symbol name) {
     values_.erase(find(name, true));
+    This()->onAttributesChanged();
     return This();
   }
   bool hasAttributes() const {
@@ -244,6 +246,7 @@ struct Attributes {
     } else {
       *it = std::move(nv);
     }
+    This()->onAttributesChanged();
     return This();
   }
   template <typename T>
@@ -509,6 +512,10 @@ struct Node : public Attributes<Node> {
   const Graph* owningGraph() const {
     return graph_;
   }
+  // Called by Attributes<Node> after any attribute add/remove/copy so the
+  // owning Graph can keep its subgraph-bearing-node index in sync. Defined
+  // out-of-line below, after Graph is complete.
+  void onAttributesChanged();
   size_t stage() const {
     return stage_;
   }
@@ -929,6 +936,31 @@ struct Graph final {
   // those explicitly, unchanged from before.
   std::unordered_set<std::string> used_names_;
 
+  // Nodes that currently carry at least one subgraph-typed attribute (kind g
+  // or gs -- If/Loop/Scan bodies, or any custom op with a graph attribute).
+  // Kept in sync by Node::onAttributesChanged() (called from Attributes<Node>
+  // after set/removeAttribute/copyAttributes) and by freeNode(), so
+  // isNameUnique() can iterate just this handful of nodes instead of every
+  // node in the graph to find subgraphs to recurse into.
+  std::unordered_set<const Node*> subgraph_bearing_nodes_;
+
+  // Recomputes whether `n` currently has any g/gs attribute and updates
+  // subgraph_bearing_nodes_ accordingly. O(n's own attribute count), which is
+  // always small, regardless of graph size.
+  void syncSubgraphAttrTracking(Node* n) {
+    bool has_subgraph_attr = false;
+    n->forEachAttributeNameAndKind([&](Symbol, AttributeKind kind) {
+      if (kind == AttributeKind::g || kind == AttributeKind::gs) {
+        has_subgraph_attr = true;
+      }
+    });
+    if (has_subgraph_attr) {
+      subgraph_bearing_nodes_.insert(n);
+    } else {
+      subgraph_bearing_nodes_.erase(n);
+    }
+  }
+
   bool has_name_{false};
   std::string name_;
   bool has_doc_string_{false};
@@ -943,17 +975,15 @@ struct Graph final {
     if (used_names_.count(name)) {
       return false;
     }
-    // Still O(n) over this graph's nodes to find any subgraph (If/Loop/Scan
-    // body) to recurse into, but each iteration is now just a cheap
-    // attribute-kind check -- no string comparisons, no attributeNames()
-    // allocation -- since the name-bearing checks above already ruled out
-    // this graph's own names.
+    // Only nodes that actually carry a subgraph attribute (If/Loop/Scan
+    // bodies, tracked incrementally in subgraph_bearing_nodes_) need to be
+    // recursed into -- typically none, for graphs with no control-flow ops --
+    // instead of scanning every node in the graph on every call.
     bool conflict = false;
-    for (const auto& node_entry : all_nodes) {
+    for (const Node* node : subgraph_bearing_nodes_) {
       if (conflict) {
         break;
       }
-      const Node* node = node_entry.first;
       node->forEachAttributeNameAndKind([&](Symbol attr, AttributeKind kind) {
         if (conflict) {
           return;
@@ -1293,6 +1323,7 @@ struct Graph final {
     auto it = all_nodes.find(n);
     ONNX_ASSERT(it != all_nodes.end())
     all_nodes.erase(it);
+    subgraph_bearing_nodes_.erase(n);
   }
   void freeValue(Value* v) {
     if (v->has_unique_name()) {
@@ -1394,6 +1425,10 @@ inline void Value::replaceAllUsesWith(Value* newValue) {
 }
 
 inline Node::Node(Graph& graph, NodeKind kind) : kind_(kind), graph_(&graph), stage_(graph.new_node_stage_) {}
+
+inline void Node::onAttributesChanged() {
+  graph_->syncSubgraphAttrTracking(this);
+}
 
 inline Value* Graph::createValue(Node& node, size_t offset) {
   auto value = std::make_unique<Value>(node, offset);
