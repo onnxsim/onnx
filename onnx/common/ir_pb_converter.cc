@@ -7,6 +7,8 @@
 
 #include "onnx/common/ir_pb_converter.h"
 
+#include "onnx/common/ir_pb_converter_internal.h"
+
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -234,7 +236,7 @@ static void convertAttributes(const ONNX_NAMESPACE::NodeProto& np, Node& n, cons
   }
 }
 
-static std::vector<Dimension> tensorShapeProtoToDimensions(const ONNX_NAMESPACE::TensorShapeProto& tsp) {
+std::vector<Dimension> tensorShapeProtoToDimensions(const ONNX_NAMESPACE::TensorShapeProto& tsp) {
   std::vector<Dimension> dims;
   dims.reserve(tsp.dim_size());
   for (int i = 0; i < tsp.dim_size(); i++) {
@@ -613,7 +615,7 @@ static void encodeTensorGeneric(ONNX_NAMESPACE::TensorProto& p, TensorT& tensor)
   }
 }
 
-static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, const Tensor& tensor) {
+void encodeTensor(ONNX_NAMESPACE::TensorProto& p, const Tensor& tensor) {
   encodeTensorGeneric(p, tensor);
 }
 
@@ -621,7 +623,7 @@ static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, Tensor& tensor) {
   encodeTensorGeneric(p, tensor);
 }
 
-static void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol name, bool consume_tensor_data) {
+void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol name, bool consume_tensor_data) {
   auto* attr = n_p.add_attribute();
   attr->set_name(name.toString());
   switch (n.kindOf(name)) {
@@ -691,7 +693,7 @@ static void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol n
   }
 }
 
-static void encodeTypeProtoTensorType(ONNX_NAMESPACE::TypeProto_Tensor& tensor_type, const Value& n) {
+void encodeTypeProtoTensorType(ONNX_NAMESPACE::TypeProto_Tensor& tensor_type, const Value& n) {
   if (n.elemType() != 0) {
     tensor_type.set_elem_type(n.elemType());
   }
