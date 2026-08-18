@@ -9,6 +9,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "onnx/common/constants.h"
@@ -132,6 +133,15 @@ void EncodeShapeOnly(TensorProto& out, const Tensor& t) {
 // large-tensor-copy cost through node *attributes* rather than graph
 // initializers -- e.g. a Constant node produced by folding, which is a
 // per-node attribute rather than a graph initializer, but exactly as large.
+//
+// GRAPH/GRAPHS-kind attributes (If/Loop/Scan's bodies) go through
+// addAttribute unconditionally, no size gate: a control-flow subgraph body
+// is a small computational structure, not a weight tensor, so the copy cost
+// this function otherwise guards against does not apply to it the same way.
+// See ProcessNode's subgraph handling for why exporting a real GraphProto
+// here (rather than skipping, as an earlier version of this file did) is
+// what lets If/Loop/Scan's own inference functions recurse into their body
+// via onnx's existing, unmodified GraphInferencerImpl/InferShapesImpl.
 void AddAttributeForInference(NodeProto& np, Node& node, Symbol name) {
   AttributeKind kind = node.kindOf(name);
   if (kind == AttributeKind::t) {
@@ -169,6 +179,66 @@ void AddAttributeForInference(NodeProto& np, Node& node, Symbol name) {
   addAttribute(np, node, name, /*consume_tensor_data=*/false);
 }
 
+// A shape_inference::SymbolTable seeded directly from the Graph IR's own
+// Values rather than a GraphProto. Without this, every dimension shape
+// inference can't pin a concrete value to (Reshape's dynamic output rank,
+// Resize's output spatial dims, ...) stays a bare, nameless "unknown" --
+// which loses the identity onnx's own reference inference captures by
+// naming it (e.g. "unk__11") and reusing that same name wherever the same
+// unknown quantity flows to (Transpose, Cast, ...). Two independently
+// unnamed dims are indistinguishable from each other and from "0", which
+// is a real correctness gap for anything downstream that needs the merge
+// logic to recognize "these are the same unknown" versus "these differ":
+// left unfixed, this manifested as onnxsim producing shapes ONNX Runtime's
+// own (name-carrying) inference then rejects as incompatible.
+// GenerateSymbolicShape (called via MaterializeSymbolicShape, see
+// ProcessNode) is what actually assigns names to bare dims; this class only
+// supplies the naming authority + collision avoidance, mirroring
+// SymbolTableImpl's addFromGraph but scanning Values instead of a
+// GraphProto's value_info/input/output lists.
+class GraphIrSymbolTable : public SymbolTable {
+ public:
+  // addFromGraph exists only to satisfy the abstract interface: a nested
+  // subgraph's own recursive InferShapesImpl call (see ProcessNode's
+  // GraphInferenceContext) may call it on the protobuf subgraph this file
+  // exports, so symbols already used inside a subgraph body don't collide
+  // with ones generated for the enclosing graph either.
+  void addFromGraph(const GraphProto& g) override {
+    AddExistingDims(g.input());
+    AddExistingDims(g.output());
+    AddExistingDims(g.value_info());
+  }
+  void AddExistingSymbol(const std::string& symbol) {
+    existing_symbols_.insert(symbol);
+  }
+  std::string createNew(const std::string& symbol_prefix) override {
+    std::string new_symbol;
+    do {
+      new_symbol = symbol_prefix + std::to_string(index_++);
+    } while (existing_symbols_.count(new_symbol) > 0);
+    existing_symbols_.insert(new_symbol);
+    return new_symbol;
+  }
+
+ private:
+  template <typename RepeatedValueInfo>
+  void AddExistingDims(const RepeatedValueInfo& value_infos) {
+    for (const auto& vi : value_infos) {
+      if (!vi.type().has_tensor_type() || !vi.type().tensor_type().has_shape()) {
+        continue;
+      }
+      for (const auto& dim : vi.type().tensor_type().shape().dim()) {
+        if (dim.has_dim_param()) {
+          existing_symbols_.insert(dim.dim_param());
+        }
+      }
+    }
+  }
+
+  unsigned int index_ = 0;
+  std::unordered_set<std::string> existing_symbols_;
+};
+
 class GraphShapeInferenceRunner {
  public:
   explicit GraphShapeInferenceRunner(const ShapeInferenceOptions& options) : options_(options) {}
@@ -191,12 +261,80 @@ class GraphShapeInferenceRunner {
       initializer_by_name[initializer_names[i]] = &initializers[i];
     }
 
+    // Whole-graph accumulating type map, mirroring onnx's own protobuf-based
+    // InferShapesImpl's "value_types_by_name": used only to resolve an
+    // If/Loop/Scan subgraph's *captured* references (a name used inside the
+    // body with no local definition -- see ir_pb_converter.cc's kCaptured)
+    // against the enclosing scope. Ordinary per-node input lookups below
+    // don't need this; only GraphInferenceContext does. outer_scope_storage
+    // owns the TypeProto objects (must outlive every node visit in this
+    // Run() call, unlike the per-node-local TypeProtos in ProcessNode);
+    // outer_scope_types is the name->pointer view GraphInferenceContext
+    // actually takes. unordered_map references stay valid across further
+    // insertions, so pointers into outer_scope_storage handed out now stay
+    // good as later nodes add their own entries.
+    std::unordered_map<std::string, TypeProto> outer_scope_storage;
+    std::unordered_map<std::string, TypeProto*> outer_scope_types;
+    auto RecordOuterScopeType = [&](Value* v) {
+      TypeProto& t = outer_scope_storage[v->uniqueName()];
+      EncodeCurrentType(*v, t);
+      if (t.value_case() != TypeProto::VALUE_NOT_SET) {
+        outer_scope_types[v->uniqueName()] = &t;
+      }
+    };
+    for (Value* input : g.inputs()) {
+      RecordOuterScopeType(input);
+    }
+    for (size_t i = 0; i < initializers.size(); ++i) {
+      // Input has priority over initializer of the same name, matching
+      // onnx's own ProcessInitializer.
+      if (outer_scope_types.count(initializer_names[i]) > 0) {
+        continue;
+      }
+      TypeProto& t = outer_scope_storage[initializer_names[i]];
+      auto* tensor_type = t.mutable_tensor_type();
+      tensor_type->set_elem_type(initializers[i].elem_type());
+      auto* shape = tensor_type->mutable_shape();
+      for (int64_t d : initializers[i].sizes()) {
+        shape->add_dim()->set_dim_value(d);
+      }
+      outer_scope_types[initializer_names[i]] = &t;
+    }
+
+    // Seed the symbol table with every dim_param already anywhere in the
+    // graph -- both the original model's own named dims and any symbol a
+    // previous Run() call materialized onto a Value that survived into this
+    // round -- so a freshly-generated name (see GraphIrSymbolTable) can
+    // never collide with (and be wrongly treated as identical to) an
+    // unrelated existing one.
+    auto SeedSymbolTable = [&](Value* v) {
+      if (!v->has_sizes()) {
+        return;
+      }
+      for (const Dimension& d : v->sizes()) {
+        if (!d.is_unknown && !d.is_int && !d.param.empty()) {
+          symbol_table_.AddExistingSymbol(d.param);
+        }
+      }
+    };
+    for (Value* input : g.inputs()) {
+      SeedSymbolTable(input);
+    }
+    for (Node* node : g.nodes()) {
+      for (Value* output : node->outputs()) {
+        SeedSymbolTable(output);
+      }
+    }
+
     bool changed = false;
     for (Node* node : g.nodes()) {
       if (node->kind() == kUndefined || node->kind() == kCaptured) {
         continue;
       }
-      changed |= ProcessNode(*node, opset_imports, registry, initializer_by_name);
+      changed |= ProcessNode(*node, opset_imports, registry, initializer_by_name, outer_scope_types);
+      for (Value* output : node->outputs()) {
+        RecordOuterScopeType(output);
+      }
     }
     return changed;
   }
@@ -206,15 +344,16 @@ class GraphShapeInferenceRunner {
       Node& node,
       const std::unordered_map<std::string, int>& opset_imports,
       const ISchemaRegistry* registry,
-      const std::unordered_map<std::string, const Tensor*>& initializer_by_name) {
+      const std::unordered_map<std::string, const Tensor*>& initializer_by_name,
+      const std::unordered_map<std::string, TypeProto*>& outer_scope_types) {
     const std::vector<Symbol> attr_names = node.attributeNames();
 
-    // v1 limitation: control-flow ops (If/Loop/Scan) are not inferred here --
-    // see graph_shape_inference.h's doc comment.
+    bool has_subgraph_attr = false;
     for (Symbol name : attr_names) {
       AttributeKind kind = node.kindOf(name);
       if (kind == AttributeKind::g || kind == AttributeKind::gs) {
-        return false;
+        has_subgraph_attr = true;
+        break;
       }
     }
 
@@ -288,6 +427,19 @@ class GraphShapeInferenceRunner {
       }
     }
 
+    // Lets If/Loop/Scan's own (unmodified, schema-registered) inference
+    // function recurse into its now-fully-exported body subgraph: it calls
+    // ctx.getGraphAttributeInferencer(attr_name), which InferenceContextImpl
+    // answers by building a GraphInferencerImpl over np's real GraphProto
+    // attribute (see AddAttributeForInference) and this context -- entirely
+    // onnx's own existing protobuf-based machinery, run once per node visit
+    // on just that node's (typically small) body, not the whole graph.
+    std::unique_ptr<shape_inference::GraphInferenceContext> graph_inference_context;
+    if (has_subgraph_attr) {
+      graph_inference_context =
+          std::make_unique<shape_inference::GraphInferenceContext>(outer_scope_types, opset_imports, &symbol_table_);
+    }
+
     shape_inference::InferenceContextImpl ctx(
         np,
         value_types_by_name,
@@ -295,36 +447,54 @@ class GraphShapeInferenceRunner {
         input_sparse_data_by_name,
         options_,
         /*generatedShapeData=*/nullptr,
-        /*graphInferenceContext=*/nullptr);
+        graph_inference_context.get());
 
+    // Both the schema function itself and mergeShapesAndTypes below
+    // (called via checkShapesAndTypes) can throw on a genuine conflict --
+    // e.g. this value's shape was already set from some other source (the
+    // original exporter's value_info, a previous round's inference) and
+    // disagrees with what this round just inferred. onnx's own
+    // protobuf-based InferShapesImpl catches exactly this span (schema call
+    // through the corresponding UpdateType) as one unit, so mirror that
+    // here: a node-level inference error doesn't abort the whole pass, it
+    // just leaves that node's outputs as they were, exactly as if the op
+    // had no registered schema.
+    bool changed = false;
     ONNX_TRY {
       schema->GetTypeAndShapeInferenceFunction()(ctx);
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        TypeProto* inferred = ctx.getOutputType(i);
+        if (inferred == nullptr) {
+          continue;
+        }
+        // Name any dim this node's own inference just produced with no
+        // dim_value/dim_param (e.g. a data-dependent Reshape/Resize output)
+        // before merging it against `existing` -- matching onnx's own
+        // UpdateType, which calls this on the freshly-inferred type first
+        // thing. Without it, two genuinely-different unknown dims are both
+        // indistinguishable bare "unknowns", which downstream ops and
+        // ONNX Runtime's own (name-carrying) reference inference do not
+        // treat as equivalent -- see GraphIrSymbolTable's comment.
+        shape_inference::MaterializeSymbolicShape(inferred, symbol_table_);
+        Value* out = outputs[i];
+        TypeProto existing;
+        EncodeCurrentType(*out, existing);
+        if (shape_inference::mergeShapesAndTypes(*inferred, &existing)) {
+          changed = true;
+          ApplyInferredType(existing, *out);
+        }
+      }
     }
     ONNX_CATCH(const std::exception&) {
-      // Matches onnx's own default (ShapeInferenceOptions::error_mode == 0):
-      // a node-level inference error doesn't abort the whole pass, it just
-      // leaves that node's outputs as they were.
       return false;
-    }
-
-    bool changed = false;
-    for (size_t i = 0; i < outputs.size(); ++i) {
-      TypeProto* inferred = ctx.getOutputType(i);
-      if (inferred == nullptr) {
-        continue;
-      }
-      Value* out = outputs[i];
-      TypeProto existing;
-      EncodeCurrentType(*out, existing);
-      if (shape_inference::mergeShapesAndTypes(*inferred, &existing)) {
-        changed = true;
-        ApplyInferredType(existing, *out);
-      }
     }
     return changed;
   }
 
   const ShapeInferenceOptions& options_;
+  // Reset (default-constructed) for every Run() call and re-seeded from the
+  // graph's current state each time -- see the seeding loop in Run().
+  GraphIrSymbolTable symbol_table_;
 };
 
 } // namespace
