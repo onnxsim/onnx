@@ -1127,6 +1127,13 @@ struct Graph final {
   const std::vector<Tensor>& initializers() const {
     return initializers_;
   }
+  // Mutable access, used by the ir_pb_converter's "consuming" Export path to
+  // move each initializer's raw bytes into the output TensorProto instead of
+  // copying them. Only safe for a caller that discards this Graph right
+  // after exporting it (see ExportModelProto's consume_tensor_data param).
+  std::vector<Tensor>& initializers_mutable() {
+    return initializers_;
+  }
   const std::vector<std::string>& initializer_names() const {
     return initializer_names_;
   }
