@@ -258,7 +258,7 @@ class GraphShapeInferenceRunner {
     const auto& initializer_names = g.initializer_names();
     initializer_by_name.reserve(initializers.size());
     for (size_t i = 0; i < initializers.size(); ++i) {
-      initializer_by_name[initializer_names[i]] = &initializers[i];
+      initializer_by_name[initializer_names[i]] = initializers[i].get();
     }
 
     // Whole-graph accumulating type map, mirroring onnx's own protobuf-based
@@ -293,9 +293,9 @@ class GraphShapeInferenceRunner {
       }
       TypeProto& t = outer_scope_storage[initializer_names[i]];
       auto* tensor_type = t.mutable_tensor_type();
-      tensor_type->set_elem_type(initializers[i].elem_type());
+      tensor_type->set_elem_type(initializers[i]->elem_type());
       auto* shape = tensor_type->mutable_shape();
-      for (int64_t d : initializers[i].sizes()) {
+      for (int64_t d : initializers[i]->sizes()) {
         shape->add_dim()->set_dim_value(d);
       }
       outer_scope_types[initializer_names[i]] = &t;
