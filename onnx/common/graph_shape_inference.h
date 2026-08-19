@@ -19,7 +19,7 @@ namespace ONNX_NAMESPACE {
 // NodeProto/TypeProto/TensorProto view built on the fly from the Node/Value
 // being visited), and results are merged back with onnx's own
 // shape_inference::mergeShapesAndTypes -- so behavior matches
-// onnx::shape_inference::InferShapes as closely as a from-scratch Graph-level
+// ONNX_NAMESPACE::shape_inference::InferShapes as closely as a from-scratch Graph-level
 // driver reasonably can, without reimplementing any op's inference formula.
 //
 // Written for onnxsim issue #633's "remaining option 2": OptAndShape's fixed
@@ -53,12 +53,12 @@ namespace ONNX_NAMESPACE {
 //  - Sparse tensor inputs are not fed to getInputSparseData().
 //  - No SymbolTable is threaded through, so symbolic (dim_param) shapes
 //    are not materialized/unified across a Loop's iterations the way
-//    onnx::shape_inference::InferShapes's own SymbolTableImpl would; this
+//    ONNX_NAMESPACE::shape_inference::InferShapes's own SymbolTableImpl would; this
 //    only affects the *precision* of some symbolic shapes, never their
 //    correctness.
 //
 // Returns whether any value's inferred type/shape actually changed
-// anything, mirroring onnx::shape_inference::InferShapes's
+// anything, mirroring ONNX_NAMESPACE::shape_inference::InferShapes's
 // num_inferred_values out-param.
 bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options = ShapeInferenceOptions());
 
