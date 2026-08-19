@@ -712,7 +712,7 @@ static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g) {
   for (unsigned int i = 0; i < num_initializers; i++) {
     auto* p = p_g.add_initializer();
     p->set_name(g->initializer_names()[i]);
-    encodeTensor(*p, g->initializers()[i]);
+    encodeTensor(*p, *g->initializers()[i]);
   }
 }
 

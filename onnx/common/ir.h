@@ -924,7 +924,13 @@ struct Graph final {
   // Create an independent node list for those initializers do not exist in input
   Node* const initializer_node_;
 
-  std::vector<Tensor> initializers_;
+  // unique_ptr<Tensor> (not a plain Tensor) so a Tensor's address is stable
+  // across other initializers being inserted/erased in this vector -- other
+  // code (e.g. onnx-optimizer's TensorContentDigest cache) keys a cache on
+  // a Tensor* for the scope of one call, which a reallocating/shifting
+  // std::vector<Tensor> would silently invalidate for any elements that
+  // moved. See onnxsim issue #633's follow-up investigation.
+  std::vector<std::unique_ptr<Tensor>> initializers_;
   std::vector<std::string> initializer_names_;
   // Mirrors every name currently in use by this graph's own initializers and
   // values (node inputs/outputs, graph inputs), kept in sync at the choke
@@ -1025,7 +1031,13 @@ struct Graph final {
     if (initializer.name().empty()) {
       initializer.setName(getNextUniqueName());
     }
-    initializers_.push_back(initializer);
+    // Heap-allocated per element (not stored inline in the vector) so a
+    // Tensor's address stays valid across other initializers being
+    // inserted/erased -- callers (e.g. onnx-optimizer's
+    // TensorContentDigest cache) may key a cache on a Tensor* for the
+    // duration of a single pass call, which a reallocating/shifting
+    // std::vector<Tensor> would silently invalidate.
+    initializers_.push_back(std::make_unique<Tensor>(initializer));
     initializer_names_.push_back(initializer.name());
     used_names_.insert(initializer.name());
   }
@@ -1047,7 +1059,7 @@ struct Graph final {
         std::remove_if(
             initializers_.begin(),
             initializers_.end(),
-            [&name](Tensor& initializer) { return initializer.name() == name; }),
+            [&name](const std::unique_ptr<Tensor>& initializer) { return initializer->name() == name; }),
         initializers_.end());
     initializer_names_.erase(
         std::remove(initializer_names_.begin(), initializer_names_.end(), name), initializer_names_.end());
@@ -1066,19 +1078,28 @@ struct Graph final {
     initializers_.clear();
     initializer_names_.clear();
   }
-  const std::vector<Tensor>& initializers() const {
+  // Stored as unique_ptr<Tensor> now (see initializers_'s declaration), so
+  // this is no longer a plain std::vector<Tensor>&: callers that used to
+  // bind `const auto&` to a Tensor in a range-for now get a
+  // `const unique_ptr<Tensor>&` and need one extra `->`/`*` to reach the
+  // Tensor, same as any other owning-pointer container.
+  const std::vector<std::unique_ptr<Tensor>>& initializers() const {
     return initializers_;
   }
   const std::vector<std::string>& initializer_names() const {
     return initializer_names_;
   }
-  std::vector<Tensor>::const_iterator getInitializer(const std::string& name) const {
-    for (auto it = initializers_.cbegin(); it != initializers_.cend(); ++it) {
-      if (name == it->name()) {
-        return it;
+  // Returns nullptr if no initializer named `name` exists (previously an
+  // iterator sentinel; every caller only ever unconditionally dereferenced
+  // it, so a nullable pointer is both simpler and a closer match for how
+  // it's actually used).
+  const Tensor* getInitializer(const std::string& name) const {
+    for (const auto& initializer : initializers_) {
+      if (name == initializer->name()) {
+        return initializer.get();
       }
     }
-    return initializers_.end();
+    return nullptr;
   }
   bool is_constant_initializer(const Value* value) const {
     return value->node() == initializer_node_;
@@ -1359,7 +1380,7 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
       auto& initializer_name = owningGraph()->initializer_names_[i];
       if (initializer_name == old_name) {
         initializer_name = name;
-        owningGraph()->initializers_[i].setName(name);
+        owningGraph()->initializers_[i]->setName(name);
       }
     }
     graph->forEachNode([this, &name, &old_name](Node* node) {
