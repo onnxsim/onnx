@@ -199,6 +199,23 @@ struct Attributes {
       names.push_back(a->name);
     return names;
   }
+  // Equivalent to checking whether attributeNames() contains a Symbol whose
+  // kindOf() is g or gs, but without attributeNames()'s std::vector<Symbol>
+  // allocation -- values_ already stores each attribute's kind directly, so
+  // this only needs to walk the (typically short) existing vector. Used by
+  // Graph::forEachNode's subgraph search (see ir.h's forSelfAndEachSubGraphImpl),
+  // which calls this once per node in the graph to find nodes with a nested
+  // subgraph; that search runs on every Value::uses()/setUniqueName() call,
+  // so avoiding an allocation here matters at scale.
+  bool hasSubgraphAttribute() const {
+    for (const auto& a : values_) {
+      const auto kind = a->kind();
+      if (kind == AttributeKind::g || kind == AttributeKind::gs) {
+        return true;
+      }
+    }
+    return false;
+  }
 
 #define CREATE_ACCESSOR(Kind, method)                                           \
   Derived* method##_(Symbol name, Kind##Attr::ConstructorType v) {              \
@@ -1261,6 +1278,15 @@ struct Graph final {
     fn(self);
     for (const auto& node_entry : self->all_nodes) {
       const Node* node = node_entry.first;
+      // hasSubgraphAttribute() is a cheap, non-allocating check; skip the
+      // allocating attributeNames() call entirely for the overwhelming
+      // majority of nodes (no g/gs attribute at all -- i.e. every node
+      // outside a Loop/If/Scan-style op). This traversal runs on every
+      // Value::uses()/setUniqueName() call, so avoiding that allocation on
+      // every one of a graph's nodes matters at scale.
+      if (!node->hasSubgraphAttribute()) {
+        continue;
+      }
       for (const auto& attr : node->attributeNames()) {
         if (node->kindOf(attr) == AttributeKind::g) {
           forSelfAndEachSubGraphImpl(node->g(attr).get(), fn);
