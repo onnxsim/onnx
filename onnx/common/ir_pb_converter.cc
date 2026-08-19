@@ -7,8 +7,6 @@
 
 #include "onnx/common/ir_pb_converter.h"
 
-#include "onnx/common/ir_pb_converter_internal.h"
-
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -16,6 +14,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "onnx/common/ir_pb_converter_internal.h"
 
 namespace ONNX_NAMESPACE {
 
