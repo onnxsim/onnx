@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +21,29 @@ namespace ONNX_NAMESPACE {
 
 struct Tensor final {
  private:
+  // A process-wide-unique id, freshly (re-)assigned by every constructor AND
+  // every assignment operator below -- never preserved across a copy, a
+  // move, or a reassignment. This makes it safe to key a cache off
+  // (tensor_id_) instead of (&tensor): a `Tensor*` can be freed and its
+  // memory reused by an unrelated, later Tensor (e.g. after
+  // Graph::eraseInitializer, or a Node attribute being replaced), which
+  // would silently alias an old cache entry onto the new tensor's different
+  // content if the cache were keyed by address. tensor_id_ can't collide
+  // this way: a fresh id is minted every time a Tensor's content is
+  // established or changed, so two live objects (or an old, freed one and a
+  // new one reusing its address) never share an id while their contents
+  // could differ. See onnxoptimizer/passes/tensor_content_hash.h's
+  // TensorContentDigest cache, the motivating consumer (onnxsim issue #633).
+  //
+  // Not atomic: Tensor construction is single-threaded throughout this
+  // codebase (matching TensorContentDigest's own cache, which is likewise
+  // an unsynchronized global).
+  static uint64_t NextTensorId() {
+    static uint64_t counter = 0;
+    return counter++;
+  }
+  uint64_t tensor_id_{NextTensorId()};
+
   bool is_segment_{false};
   int64_t segment_begin_{0};
   int64_t segment_end_{0};
@@ -41,7 +65,89 @@ struct Tensor final {
   std::vector<std::pair<std::string, std::string>> external_data_;
   ONNX_NAMESPACE::TensorProto_DataLocation data_location_{ONNX_NAMESPACE::TensorProto_DataLocation_DEFAULT};
 
+  // Copies every field except tensor_id_, which each caller below sources
+  // independently (a fresh id via NextTensorId() for the constructors'
+  // member-initializer lists, this object's own existing id -- reassigned
+  // right after -- for the assignment operators).
+  void CopyFieldsFrom(const Tensor& other) {
+    is_segment_ = other.is_segment_;
+    segment_begin_ = other.segment_begin_;
+    segment_end_ = other.segment_end_;
+    has_name_ = other.has_name_;
+    name_ = other.name_;
+    elem_type_ = other.elem_type_;
+    sizes_ = other.sizes_;
+    float_data_ = other.float_data_;
+    double_data_ = other.double_data_;
+    int32_data_ = other.int32_data_;
+    int64_data_ = other.int64_data_;
+    uint64_data_ = other.uint64_data_;
+    string_data_ = other.string_data_;
+    is_raw_data_ = other.is_raw_data_;
+    raw_data_ = other.raw_data_;
+    external_data_ = other.external_data_;
+    data_location_ = other.data_location_;
+  }
+  void MoveFieldsFrom(Tensor&& other) {
+    is_segment_ = other.is_segment_;
+    segment_begin_ = other.segment_begin_;
+    segment_end_ = other.segment_end_;
+    has_name_ = other.has_name_;
+    name_ = std::move(other.name_);
+    elem_type_ = other.elem_type_;
+    sizes_ = std::move(other.sizes_);
+    float_data_ = std::move(other.float_data_);
+    double_data_ = std::move(other.double_data_);
+    int32_data_ = std::move(other.int32_data_);
+    int64_data_ = std::move(other.int64_data_);
+    uint64_data_ = std::move(other.uint64_data_);
+    string_data_ = std::move(other.string_data_);
+    is_raw_data_ = other.is_raw_data_;
+    raw_data_ = std::move(other.raw_data_);
+    external_data_ = std::move(other.external_data_);
+    data_location_ = other.data_location_;
+  }
+
  public:
+  Tensor() = default;
+  // tensor_id_ deliberately omitted from these two constructors' behavior:
+  // it keeps its own default member initializer (a fresh NextTensorId()),
+  // never other's -- a copy/move-constructed Tensor is a logically distinct
+  // object from its source, even when byte-identical right now, since nothing
+  // stops either one from being separately reassigned or fed through
+  // graph.addInitializer() (which itself copies) afterward.
+  Tensor(const Tensor& other) {
+    CopyFieldsFrom(other);
+  }
+  Tensor(Tensor&& other) noexcept {
+    MoveFieldsFrom(std::move(other));
+  }
+  Tensor& operator=(const Tensor& other) {
+    if (this != &other) {
+      CopyFieldsFrom(other);
+      // This object's content just changed, so any cache entry keyed on its
+      // previous tensor_id_ is now stale -- mint a fresh one rather than
+      // keeping this object's existing id (which would leave that stale
+      // entry silently reachable) or other's (which would collide with
+      // other's own, still-live id).
+      tensor_id_ = NextTensorId();
+    }
+    return *this;
+  }
+  Tensor& operator=(Tensor&& other) noexcept {
+    if (this != &other) {
+      MoveFieldsFrom(std::move(other));
+      tensor_id_ = NextTensorId();
+    }
+    return *this;
+  }
+
+  // See tensor_id_'s own comment above for the identity/uniqueness
+  // guarantee this provides.
+  uint64_t tensor_id() const {
+    return tensor_id_;
+  }
+
   const std::vector<int64_t>& sizes() const {
     return sizes_;
   }
