@@ -819,9 +819,10 @@ static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g, bool c
       // to the pointee, the way vector<Tensor>::operator[] would), so an
       // inline dereference resolves to encodeTensor's non-const, *moving*
       // overload here too -- silently consuming data this branch must not
-      // touch. Caught by onnxsim's test_exprimental_simplify_subgraph:
-      // shape inference's non-consuming subgraph export was silently
-      // emptying a then-branch initializer's raw_data on its first visit.
+      // touch. Caught by an onnxsim regression test for If/Loop/Scan
+      // subgraph export: shape inference's non-consuming subgraph export
+      // was silently emptying a then-branch initializer's raw_data on its
+      // first visit.
       const Tensor& t = *g->initializers()[i];
       encodeTensor(*p, t);
     }
