@@ -41,7 +41,8 @@ class AxesInputToAttribute : public Adapter {
       }
     } else {
       // Get Value name, find Initializer with same name
-      for (const auto& initializer : graph->initializers()) {
+      for (const auto& initializer_ptr : graph->initializers()) {
+        const Tensor& initializer = *initializer_ptr;
         if (initializer.name() == inputs[1]->uniqueName()) {
           node->is_(kaxes, ReadInt64Tensor(initializer));
           node->removeInput(1);

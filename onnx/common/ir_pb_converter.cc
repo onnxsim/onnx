@@ -799,9 +799,9 @@ static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g, bool c
     if (consume_tensor_data) {
       // Moves each initializer's raw bytes out of ``g`` instead of copying
       // them; see ExportModelProto's consume_tensor_data doc comment.
-      encodeTensor(*p, g->initializers_mutable()[i]);
+      encodeTensor(*p, *g->initializers_mutable()[i]);
     } else {
-      encodeTensor(*p, g->initializers()[i]);
+      encodeTensor(*p, *g->initializers()[i]);
     }
   }
 }
