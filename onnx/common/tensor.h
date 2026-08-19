@@ -88,6 +88,12 @@ struct Tensor final {
     external_data_ = other.external_data_;
     data_location_ = other.data_location_;
   }
+  // Every member below is individually moved from `other`, which is the
+  // correct and complete way to move-from an rvalue-reference parameter --
+  // but cppcoreguidelines-rvalue-reference-param-not-moved only recognizes
+  // std::move(other) applied to the parameter itself, not std::move(other.x)
+  // on its members, so it flags this as a false positive.
+  // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
   void MoveFieldsFrom(Tensor&& other) {
     is_segment_ = other.is_segment_;
     segment_begin_ = other.segment_begin_;
@@ -110,6 +116,12 @@ struct Tensor final {
 
  public:
   Tensor() = default;
+  // Explicit despite being a no-op: the copy/move constructor and
+  // copy/move assignment operator below are all user-declared (needed for
+  // tensor_id_'s semantics), which otherwise leaves the destructor as the
+  // sole implicit special member -- cppcoreguidelines-special-member-functions
+  // requires it be declared too for the rule-of-five to be unambiguous.
+  ~Tensor() = default;
   // tensor_id_ deliberately omitted from these two constructors' behavior:
   // it keeps its own default member initializer (a fresh NextTensorId()),
   // never other's -- a copy/move-constructed Tensor is a logically distinct
