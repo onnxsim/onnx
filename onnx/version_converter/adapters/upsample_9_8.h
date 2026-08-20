@@ -22,13 +22,14 @@ struct Upsample_9_8 final : public Adapter {
 
   void adapt_upsample_9_8(const std::shared_ptr<Graph>& graph, Node* node) const {
     const ArrayRef<Value*>& inputs = node->inputs();
-    const std::vector<Tensor>& initializers = graph->initializers();
+    const std::vector<std::unique_ptr<Tensor>>& initializers = graph->initializers();
 
     ONNX_ASSERTM(inputs.size() == 2, "Upsample in opset 9 needs to have 2 inputs.")
     // Safe to access inputs[1] after assertion above
     std::string scale_input_name = inputs[1]->uniqueName();
 
-    for (const auto& initializer : initializers) {
+    for (const auto& initializer_ptr : initializers) {
+      const Tensor& initializer = *initializer_ptr;
       if (initializer.name() == inputs[1]->uniqueName()) {
         std::vector<float> value = ParseData<float>(&initializer);
         std::vector<double> d_values;
