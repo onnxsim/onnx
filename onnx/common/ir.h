@@ -199,6 +199,23 @@ struct Attributes {
       names.push_back(a->name);
     return names;
   }
+  // Equivalent to checking whether attributeNames() contains a Symbol whose
+  // kindOf() is g or gs, but without attributeNames()'s std::vector<Symbol>
+  // allocation -- values_ already stores each attribute's kind directly, so
+  // this only needs to walk the (typically short) existing vector. Used by
+  // Graph::forEachNode's subgraph search (see ir.h's forSelfAndEachSubGraphImpl),
+  // which calls this once per node in the graph to find nodes with a nested
+  // subgraph; that search runs on every Value::uses()/setUniqueName() call,
+  // so avoiding an allocation here matters at scale.
+  bool hasSubgraphAttribute() const {
+    for (const auto& a : values_) {
+      const auto kind = a->kind();
+      if (kind == AttributeKind::g || kind == AttributeKind::gs) {
+        return true;
+      }
+    }
+    return false;
+  }
 
 #define CREATE_ACCESSOR(Kind, method)                                           \
   Derived* method##_(Symbol name, Kind##Attr::ConstructorType v) {              \
@@ -373,6 +390,19 @@ struct Value final {
   const Graph* owningGraph() const;
   use_list uses() const;
 
+  // Cheap (O(1)) equivalent of ``!uses().empty()`` that only sees uses from
+  // nodes directly in this value's owning graph, not uses().'s additional
+  // owningGraph()->forEachNode() scan for kCaptured placeholders in nested
+  // If/Loop/Scan subgraph bodies (see uses()'s definition below). Safe to use
+  // in place of ``!uses().empty()`` only when the caller has separately
+  // established that no such capture is possible -- e.g. the whole graph
+  // tree contains no node with a subgraph attribute at all, which a caller
+  // visiting every node in a loop (as DCE/CSE do) can check once up front
+  // instead of paying uses()'s full-graph subgraph scan on every node.
+  bool hasUsesInCurrentGraph() const {
+    return !uses_in_current_graph_.empty();
+  }
+
   // Replaces all uses of this node with 'newValue'.
   //
   // Given:   %3 = f(%1, %2)
@@ -386,7 +416,16 @@ struct Value final {
 
   Value* copyMetadata(const Value* from) {
     setElemType(from->elemType());
-    setSizes(from->sizes());
+    if (from->has_sizes()) {
+      setSizes(from->sizes());
+    } else {
+      // Unconditionally calling setSizes(from->sizes()) here would copy an
+      // *empty* vector when `from` has no known rank (has_sizes() false),
+      // which setSizes() would then mark as a definite, present rank-0
+      // (scalar) shape -- silently corrupting "rank unknown" into "rank 0"
+      // for any Value copied from one with no shape info yet.
+      wipeSizes();
+    }
     if (from->has_unique_name()) {
       setUniqueName(from->uniqueName());
     }
@@ -538,6 +577,15 @@ struct Node : public Attributes<Node> {
   bool hasUses() const {
     for (const auto* o : outputs()) {
       if (!o->uses().empty())
+        return true;
+    }
+    return false;
+  }
+  // Cheap equivalent of hasUses() -- see Value::hasUsesInCurrentGraph()'s
+  // comment for exactly what this does and doesn't see.
+  bool hasUsesInCurrentGraph() const {
+    for (const auto* o : outputs()) {
+      if (o->hasUsesInCurrentGraph())
         return true;
     }
     return false;
@@ -908,7 +956,13 @@ struct Graph final {
   // Create an independent node list for those initializers do not exist in input
   Node* const initializer_node_;
 
-  std::vector<Tensor> initializers_;
+  // unique_ptr<Tensor> (not a plain Tensor) so a Tensor's address is stable
+  // across other initializers being inserted/erased in this vector -- other
+  // code (e.g. onnx-optimizer's TensorContentDigest cache) keys a cache on
+  // a Tensor* for the scope of one call, which a reallocating/shifting
+  // std::vector<Tensor> would silently invalidate for any elements that
+  // moved. See onnxsim issue #633's follow-up investigation.
+  std::vector<std::unique_ptr<Tensor>> initializers_;
   std::vector<std::string> initializer_names_;
 
   bool has_name_{false};
@@ -969,7 +1023,13 @@ struct Graph final {
     if (initializer.name().empty()) {
       initializer.setName(getNextUniqueName());
     }
-    initializers_.push_back(initializer);
+    // Heap-allocated per element (not stored inline in the vector) so a
+    // Tensor's address stays valid across other initializers being
+    // inserted/erased -- callers (e.g. onnx-optimizer's
+    // TensorContentDigest cache) may key a cache on a Tensor* for the
+    // duration of a single pass call, which a reallocating/shifting
+    // std::vector<Tensor> would silently invalidate.
+    initializers_.push_back(std::make_unique<Tensor>(initializer));
     initializer_names_.push_back(initializer.name());
   }
 
@@ -990,7 +1050,7 @@ struct Graph final {
         std::remove_if(
             initializers_.begin(),
             initializers_.end(),
-            [&name](Tensor& initializer) { return initializer.name() == name; }),
+            [&name](const std::unique_ptr<Tensor>& initializer) { return initializer->name() == name; }),
         initializers_.end());
     initializer_names_.erase(
         std::remove(initializer_names_.begin(), initializer_names_.end(), name), initializer_names_.end());
@@ -1005,19 +1065,35 @@ struct Graph final {
     initializers_.clear();
     initializer_names_.clear();
   }
-  const std::vector<Tensor>& initializers() const {
+  // Stored as unique_ptr<Tensor> now (see initializers_'s declaration), so
+  // this is no longer a plain std::vector<Tensor>&: callers that used to
+  // bind `const auto&` to a Tensor in a range-for now get a
+  // `const unique_ptr<Tensor>&` and need one extra `->`/`*` to reach the
+  // Tensor, same as any other owning-pointer container.
+  const std::vector<std::unique_ptr<Tensor>>& initializers() const {
+    return initializers_;
+  }
+  // Mutable access, used by the ir_pb_converter's "consuming" Export path to
+  // move each initializer's raw bytes into the output TensorProto instead of
+  // copying them. Only safe for a caller that discards this Graph right
+  // after exporting it (see ExportModelProto's consume_tensor_data param).
+  std::vector<std::unique_ptr<Tensor>>& initializers_mutable() {
     return initializers_;
   }
   const std::vector<std::string>& initializer_names() const {
     return initializer_names_;
   }
-  std::vector<Tensor>::const_iterator getInitializer(const std::string& name) const {
-    for (auto it = initializers_.cbegin(); it != initializers_.cend(); ++it) {
-      if (name == it->name()) {
-        return it;
+  // Returns nullptr if no initializer named `name` exists (previously an
+  // iterator sentinel; every caller only ever unconditionally dereferenced
+  // it, so a nullable pointer is both simpler and a closer match for how
+  // it's actually used).
+  const Tensor* getInitializer(const std::string& name) const {
+    for (const auto& initializer : initializers_) {
+      if (name == initializer->name()) {
+        return initializer.get();
       }
     }
-    return initializers_.end();
+    return nullptr;
   }
   bool is_constant_initializer(const Value* value) const {
     return value->node() == initializer_node_;
@@ -1224,6 +1300,15 @@ struct Graph final {
     fn(self);
     for (const auto& node_entry : self->all_nodes) {
       const Node* node = node_entry.first;
+      // hasSubgraphAttribute() is a cheap, non-allocating check; skip the
+      // allocating attributeNames() call entirely for the overwhelming
+      // majority of nodes (no g/gs attribute at all -- i.e. every node
+      // outside a Loop/If/Scan-style op). This traversal runs on every
+      // Value::uses()/setUniqueName() call, so avoiding that allocation on
+      // every one of a graph's nodes matters at scale.
+      if (!node->hasSubgraphAttribute()) {
+        continue;
+      }
       for (const auto& attr : node->attributeNames()) {
         if (node->kindOf(attr) == AttributeKind::g) {
           forSelfAndEachSubGraphImpl(node->g(attr).get(), fn);
@@ -1289,7 +1374,7 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
       auto& initializer_name = owningGraph()->initializer_names_[i];
       if (initializer_name == old_name) {
         initializer_name = name;
-        owningGraph()->initializers_[i].setName(name);
+        owningGraph()->initializers_[i]->setName(name);
       }
     }
     graph->forEachNode([this, &name, &old_name](Node* node) {
