@@ -409,7 +409,16 @@ struct Value final {
 
   Value* copyMetadata(const Value* from) {
     setElemType(from->elemType());
-    setSizes(from->sizes());
+    if (from->has_sizes()) {
+      setSizes(from->sizes());
+    } else {
+      // Unconditionally calling setSizes(from->sizes()) here would copy an
+      // *empty* vector when `from` has no known rank (has_sizes() false),
+      // which setSizes() would then mark as a definite, present rank-0
+      // (scalar) shape -- silently corrupting "rank unknown" into "rank 0"
+      // for any Value copied from one with no shape info yet.
+      wipeSizes();
+    }
     if (from->has_unique_name()) {
       setUniqueName(from->uniqueName());
     }
@@ -1084,7 +1093,7 @@ struct Graph final {
         std::remove_if(
             initializers_.begin(),
             initializers_.end(),
-            [&stable_name](Tensor& initializer) { return initializer.name() == stable_name; }),
+            [&name](const Tensor& initializer) { return initializer.name() == name; }),
         initializers_.end());
     initializer_names_.erase(
         std::remove(initializer_names_.begin(), initializer_names_.end(), stable_name), initializer_names_.end());
@@ -1106,16 +1115,27 @@ struct Graph final {
   const std::vector<Tensor>& initializers() const {
     return initializers_;
   }
+  // Mutable access, used by the ir_pb_converter's "consuming" Export path to
+  // move each initializer's raw bytes into the output TensorProto instead of
+  // copying them. Only safe for a caller that discards this Graph right
+  // after exporting it (see ExportModelProto's consume_tensor_data param).
+  std::vector<Tensor>& initializers_mutable() {
+    return initializers_;
+  }
   const std::vector<std::string>& initializer_names() const {
     return initializer_names_;
   }
-  std::vector<Tensor>::const_iterator getInitializer(const std::string& name) const {
-    for (auto it = initializers_.cbegin(); it != initializers_.cend(); ++it) {
-      if (name == it->name()) {
-        return it;
+  // Returns nullptr if no initializer named `name` exists (previously an
+  // iterator sentinel; every caller only ever unconditionally dereferenced
+  // it, so a nullable pointer is both simpler and a closer match for how
+  // it's actually used).
+  const Tensor* getInitializer(const std::string& name) const {
+    for (const auto& initializer : initializers_) {
+      if (name == initializer.name()) {
+        return &initializer;
       }
     }
-    return initializers_.end();
+    return nullptr;
   }
   bool is_constant_initializer(const Value* value) const {
     return value->node() == initializer_node_;

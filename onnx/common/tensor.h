@@ -121,6 +121,15 @@ struct Tensor final {
     return raw_data_;
   }
 
+  // Mutable access to the raw-data buffer. Used by the ir_pb_converter's
+  // "consuming" Export path to move the bytes into the output TensorProto
+  // instead of copying them, when the caller has established the source
+  // Graph is discarded immediately afterward. Not needed for the common
+  // read-only case (raw()) or for whole-tensor replacement (set_raw_data()).
+  std::string& mutable_raw() {
+    return raw_data_;
+  }
+
   void set_raw_data(std::string raw_data) {
     is_raw_data_ = true;
     raw_data_ = std::move(raw_data);

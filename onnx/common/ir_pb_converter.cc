@@ -9,17 +9,29 @@
 
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "onnx/common/ir_pb_converter_internal.h"
+
 namespace ONNX_NAMESPACE {
 
 // Part 1: convert ONNX Protobuf to IR
 static std::unique_ptr<Graph> graphProtoToGraph(const GraphProto& gp, bool nested, int64_t ir_version = IR_VERSION);
+static std::unique_ptr<Graph> graphProtoToGraph(GraphProto& gp, bool nested, int64_t ir_version = IR_VERSION);
 
-static Tensor tensorProtoToTensor(const ONNX_NAMESPACE::TensorProto& tp) {
+// Shared by the const (copying) and mutable (consuming/moving) overloads
+// below -- ``TensorProtoT`` is deduced as either ``const TensorProto`` or
+// ``TensorProto``. Only the raw_data handling differs between the two: the
+// mutable path moves the bytes out of ``tp`` instead of copying them, which
+// is the dominant cost of this conversion for weight-heavy models (see
+// onnxsim issue #633). ``tp`` must not be read for its raw data after a call
+// through the mutable overload.
+template <typename TensorProtoT>
+static Tensor tensorProtoToTensorGeneric(TensorProtoT& tp) {
   Tensor ret;
 
   ret.sizes().reserve(tp.dims_size());
@@ -100,7 +112,13 @@ static Tensor tensorProtoToTensor(const ONNX_NAMESPACE::TensorProto& tp) {
   // The only way to know if we should be using raw_data or
   // <type>_data is to look at which of them is size zero.
   if (tp.has_raw_data()) {
-    ret.set_raw_data(tp.raw_data());
+    if constexpr (std::is_const_v<TensorProtoT>) {
+      ret.set_raw_data(tp.raw_data());
+    } else {
+      // Moves the bytes out of ``tp`` (a TensorProto* mutable_raw_data()
+      // pointer to an empty-but-valid string) instead of copying them.
+      ret.set_raw_data(std::move(*tp.mutable_raw_data()));
+    }
   }
 
   if (tp.has_name()) {
@@ -117,6 +135,14 @@ static Tensor tensorProtoToTensor(const ONNX_NAMESPACE::TensorProto& tp) {
     ret.data_location() = tp.data_location();
   }
   return ret;
+}
+
+static Tensor tensorProtoToTensor(const ONNX_NAMESPACE::TensorProto& tp) {
+  return tensorProtoToTensorGeneric(tp);
+}
+
+static Tensor tensorProtoToTensor(ONNX_NAMESPACE::TensorProto& tp) {
+  return tensorProtoToTensorGeneric(tp);
 }
 
 static void convertAttribute(const ONNX_NAMESPACE::AttributeProto& ap, Node& n, const int64_t ir_version = IR_VERSION) {
@@ -210,7 +236,7 @@ static void convertAttributes(const ONNX_NAMESPACE::NodeProto& np, Node& n, cons
   }
 }
 
-static std::vector<Dimension> tensorShapeProtoToDimensions(const ONNX_NAMESPACE::TensorShapeProto& tsp) {
+std::vector<Dimension> tensorShapeProtoToDimensions(const ONNX_NAMESPACE::TensorShapeProto& tsp) {
   std::vector<Dimension> dims;
   dims.reserve(tsp.dim_size());
   for (int i = 0; i < tsp.dim_size(); i++) {
@@ -239,7 +265,14 @@ static Value* createDummyValue(
   return v;
 }
 
-std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, bool nested, const int64_t ir_version) {
+// Shared by the const (copying) and mutable (consuming/moving) overloads
+// below, mirroring tensorProtoToTensorGeneric above. The only place the two
+// modes differ is the initializer loop, which is the one part of this
+// conversion that touches potentially-large tensor bytes; everything else
+// (nodes, attributes, value_info, ...) is comparatively small metadata, so
+// it stays on the ordinary copying path for both overloads.
+template <typename GraphProtoT>
+static std::unique_ptr<Graph> graphProtoToGraphGeneric(GraphProtoT& gp, bool nested, const int64_t ir_version) {
   auto g = std::make_unique<Graph>();
 
   if (gp.has_name()) {
@@ -305,7 +338,14 @@ std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, b
   // initializers should be added before all nodes,
   // otherwise getNextUnique() may conflicts with an existing initializer name.
   for (int i = 0; i < gp.initializer_size(); ++i) {
-    auto init = tensorProtoToTensor(gp.initializer(i));
+    Tensor init;
+    if constexpr (std::is_const_v<GraphProtoT>) {
+      init = tensorProtoToTensor(gp.initializer(i));
+    } else {
+      // Moves the initializer's raw bytes out of ``gp`` rather than copying
+      // them; see tensorProtoToTensorGeneric.
+      init = tensorProtoToTensor(*gp.mutable_initializer(i));
+    }
     // If ir_version >= 4, initializer does not have to be included in input
     // Create a Value from initializer by addInitializerNode if name does not exist in input
     // and save it into value_by_name_of for later use (node input)
@@ -424,7 +464,19 @@ std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, b
   return g;
 }
 
-std::unique_ptr<Graph> ImportModelProto(const ModelProto& mp) {
+std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, bool nested, const int64_t ir_version) {
+  return graphProtoToGraphGeneric(gp, nested, ir_version);
+}
+
+std::unique_ptr<Graph> graphProtoToGraph(ONNX_NAMESPACE::GraphProto& gp, bool nested, const int64_t ir_version) {
+  return graphProtoToGraphGeneric(gp, nested, ir_version);
+}
+
+// Shared by the const (copying) and mutable (consuming/moving) ImportModelProto
+// overloads below; only graphProtoToGraph's choice of const vs mutable
+// initializer access differs between them.
+template <typename ModelProtoT>
+static std::unique_ptr<Graph> ImportModelProtoGeneric(ModelProtoT& mp) {
   if (!mp.has_ir_version()) {
     return nullptr;
   }
@@ -433,7 +485,12 @@ std::unique_ptr<Graph> ImportModelProto(const ModelProto& mp) {
     return nullptr;
   }
 
-  std::unique_ptr<Graph> g(graphProtoToGraph(mp.graph(), false, mp.ir_version()));
+  std::unique_ptr<Graph> g;
+  if constexpr (std::is_const_v<ModelProtoT>) {
+    g = graphProtoToGraph(mp.graph(), false, mp.ir_version());
+  } else {
+    g = graphProtoToGraph(*mp.mutable_graph(), false, mp.ir_version());
+  }
   for (int i = 0; i < mp.opset_import_size(); i++) {
     OpSetID new_opset_version(mp.opset_import(i).domain(), mp.opset_import(i).version());
     g->forSelfAndEachSubGraph(
@@ -442,14 +499,26 @@ std::unique_ptr<Graph> ImportModelProto(const ModelProto& mp) {
   return g;
 }
 
+std::unique_ptr<Graph> ImportModelProto(const ModelProto& mp) {
+  return ImportModelProtoGeneric(mp);
+}
+
+std::unique_ptr<Graph> ImportModelProto(ModelProto& mp) {
+  return ImportModelProtoGeneric(mp);
+}
+
 // Part 2: convert IR to ONNX Protobuf
 static std::string value_name(const Value& n) {
   return n.uniqueName();
 }
 
-static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g);
+static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g, bool consume_tensor_data);
 
-static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, const Tensor& tensor) {
+// Shared by the const (copying) and mutable (consuming/moving) encodeTensor
+// overloads below; only the raw_data handling differs, mirroring
+// tensorProtoToTensorGeneric on the Import side.
+template <typename TensorT>
+static void encodeTensorGeneric(ONNX_NAMESPACE::TensorProto& p, TensorT& tensor) {
   if (tensor.hasName()) {
     p.set_name(tensor.name());
   }
@@ -525,7 +594,14 @@ static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, const Tensor& tensor) {
       fail_convert("Unknown tensor data type");
   }
   if (tensor.is_raw_data()) {
-    p.set_raw_data(tensor.raw());
+    if constexpr (std::is_const_v<TensorT>) {
+      p.set_raw_data(tensor.raw());
+    } else {
+      // Moves the bytes out of ``tensor`` instead of copying them; only used
+      // when the caller has established the owning Graph is discarded right
+      // after export (see ExportModelProto's consume_tensor_data).
+      p.set_raw_data(std::move(tensor.mutable_raw()));
+    }
   }
   if (!tensor.external_data().empty()) {
     for (const auto& [key, value] : tensor.external_data()) {
@@ -539,7 +615,15 @@ static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, const Tensor& tensor) {
   }
 }
 
-static void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol name) {
+void encodeTensor(ONNX_NAMESPACE::TensorProto& p, const Tensor& tensor) {
+  encodeTensorGeneric(p, tensor);
+}
+
+static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, Tensor& tensor) {
+  encodeTensorGeneric(p, tensor);
+}
+
+void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol name, bool consume_tensor_data) {
   auto* attr = n_p.add_attribute();
   attr->set_name(name.toString());
   switch (n.kindOf(name)) {
@@ -585,13 +669,13 @@ static void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol n
     case AttributeKind::g: {
       attr->set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH);
       auto* g = attr->mutable_g();
-      encodeGraph(*g, n.g(name));
+      encodeGraph(*g, n.g(name), consume_tensor_data);
     } break;
     case AttributeKind::gs: {
       attr->set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPHS);
       for (const auto& v : n.gs(name)) {
         auto* g = attr->add_graphs();
-        encodeGraph(*g, v);
+        encodeGraph(*g, v, consume_tensor_data);
       }
     } break;
     case AttributeKind::tp: {
@@ -609,7 +693,7 @@ static void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol n
   }
 }
 
-static void encodeTypeProtoTensorType(ONNX_NAMESPACE::TypeProto_Tensor& tensor_type, const Value& n) {
+void encodeTypeProtoTensorType(ONNX_NAMESPACE::TypeProto_Tensor& tensor_type, const Value& n) {
   if (n.elemType() != 0) {
     tensor_type.set_elem_type(n.elemType());
   }
@@ -642,7 +726,7 @@ static void encodeValueInfo(ONNX_NAMESPACE::ValueInfoProto& v, Value& n) {
   }
 }
 
-static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g) {
+static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g, bool consume_tensor_data) {
   if (g->has_name()) {
     p_g.set_name(g->name());
   }
@@ -692,7 +776,7 @@ static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g) {
     }
     p_n->set_op_type(node->kind().toString());
     for (auto attr_name : node->attributeNames()) {
-      addAttribute(*p_n, *node, attr_name);
+      addAttribute(*p_n, *node, attr_name, consume_tensor_data);
     }
     if (node->has_doc_string()) {
       p_n->set_doc_string(node->docString());
@@ -712,13 +796,19 @@ static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g) {
   for (unsigned int i = 0; i < num_initializers; i++) {
     auto* p = p_g.add_initializer();
     p->set_name(g->initializer_names()[i]);
-    encodeTensor(*p, g->initializers()[i]);
+    if (consume_tensor_data) {
+      // Moves each initializer's raw bytes out of ``g`` instead of copying
+      // them; see ExportModelProto's consume_tensor_data doc comment.
+      encodeTensor(*p, g->initializers_mutable()[i]);
+    } else {
+      encodeTensor(*p, g->initializers()[i]);
+    }
   }
 }
 
-void ExportModelProto(ModelProto* p_m, const std::shared_ptr<Graph>& g) {
+void ExportModelProto(ModelProto* p_m, const std::shared_ptr<Graph>& g, bool consume_tensor_data) {
   GraphProto* p_g = p_m->mutable_graph();
-  encodeGraph(*p_g, g);
+  encodeGraph(*p_g, g, consume_tensor_data);
   // Add new opset_versions
   p_m->clear_opset_import();
   for (const OpSetID& opset : g->opset_versions_mutable()) {
