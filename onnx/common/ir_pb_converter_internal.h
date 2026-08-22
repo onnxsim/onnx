@@ -32,8 +32,10 @@ std::vector<Dimension> tensorShapeProtoToDimensions(const TensorShapeProto& tsp)
 void encodeTypeProtoTensorType(TypeProto_Tensor& tensor_type, const Value& n);
 
 // Encodes one attribute of Node `n` (by name) into NodeProto `n_p`. Defined
-// in ir_pb_converter.cc.
-void addAttribute(NodeProto& n_p, const Node& n, Symbol name);
+// in ir_pb_converter.cc; see ExportModelProto's consume_tensor_data doc
+// comment for what `consume_tensor_data` does to any TENSOR-valued
+// attribute.
+void addAttribute(NodeProto& n_p, const Node& n, Symbol name, bool consume_tensor_data);
 
 // Encodes a Tensor's contents into a TensorProto (always copying; there is
 // no consuming/moving overload since callers of this internal helper build

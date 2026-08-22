@@ -147,7 +147,7 @@ void AddAttributeForInference(NodeProto& np, Node& node, Symbol name) {
   if (kind == AttributeKind::t) {
     const Tensor& t = node.t(name);
     if (ElementCountFits(t)) {
-      addAttribute(np, node, name);
+      addAttribute(np, node, name, /*consume_tensor_data=*/false);
       return;
     }
     auto* attr = np.add_attribute();
@@ -165,7 +165,7 @@ void AddAttributeForInference(NodeProto& np, Node& node, Symbol name) {
       }
     }
     if (!any_large) {
-      addAttribute(np, node, name);
+      addAttribute(np, node, name, /*consume_tensor_data=*/false);
       return;
     }
     auto* attr = np.add_attribute();
@@ -176,7 +176,7 @@ void AddAttributeForInference(NodeProto& np, Node& node, Symbol name) {
     }
     return;
   }
-  addAttribute(np, node, name);
+  addAttribute(np, node, name, /*consume_tensor_data=*/false);
 }
 
 // A shape_inference::SymbolTable seeded directly from the Graph IR's own
