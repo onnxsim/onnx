@@ -241,7 +241,14 @@ class GraphIrSymbolTable : public SymbolTable {
 
 class GraphShapeInferenceRunner {
  public:
-  explicit GraphShapeInferenceRunner(const ShapeInferenceOptions& options) : options_(options) {}
+  explicit GraphShapeInferenceRunner(const ShapeInferenceOptions& options,
+                                      shape_inference::DataValueMap* generated_shape_data)
+      : options_(options), generated_shape_data_(generated_shape_data) {
+    if (options_.enable_data_propagation && generated_shape_data_ == nullptr) {
+      fail_shape_inference(
+          "Container for generated shape data cannot be nullptr when enable_data_propagation option is set.");
+    }
+  }
 
   // Returns whether anything changed.
   bool Run(Graph& g) {
@@ -446,7 +453,7 @@ class GraphShapeInferenceRunner {
         input_data_by_name,
         input_sparse_data_by_name,
         options_,
-        /*generatedShapeData=*/nullptr,
+        generated_shape_data_,
         graph_inference_context.get());
 
     // Both the schema function itself and mergeShapesAndTypes below
@@ -484,6 +491,19 @@ class GraphShapeInferenceRunner {
           ApplyInferredType(existing, *out);
         }
       }
+      // Mirrors ONNX_NAMESPACE::shape_inference's own ShapeInferenceImplBase::
+      // Process: after this node's ordinary type/shape inference is merged
+      // in, run its schema-registered data-propagation function (if any) to
+      // populate generated_shape_data_ with this node's outputs' concrete
+      // partial values, which later nodes' getSymbolicInput()/getInputData()
+      // (via DataPropagationContextImpl) can then read back -- e.g. chaining
+      // Shape -> Gather -> Concat end to end even though nothing here is a
+      // graph initializer.
+      if (options_.enable_data_propagation && schema->has_data_propagation_function()) {
+        shape_inference::DataPropagationContextImpl data_propagation_ctx(
+            np, value_types_by_name, input_data_by_name, *generated_shape_data_);
+        schema->GetDataPropagationFunction()(data_propagation_ctx);
+      }
     }
     ONNX_CATCH(const std::exception&) {
       return false;
@@ -492,6 +512,7 @@ class GraphShapeInferenceRunner {
   }
 
   const ShapeInferenceOptions& options_;
+  shape_inference::DataValueMap* generated_shape_data_;
   // Reset (default-constructed) for every Run() call and re-seeded from the
   // graph's current state each time -- see the seeding loop in Run().
   GraphIrSymbolTable symbol_table_;
@@ -499,8 +520,9 @@ class GraphShapeInferenceRunner {
 
 } // namespace
 
-bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options) {
-  GraphShapeInferenceRunner runner(options);
+bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options,
+                         shape_inference::DataValueMap* out_generated_shape_data) {
+  GraphShapeInferenceRunner runner(options, out_generated_shape_data);
   return runner.Run(g);
 }
 
