@@ -9,6 +9,7 @@
 
 #include "onnx/common/ir.h"
 #include "onnx/defs/shape_inference.h"
+#include "onnx/shape_inference/implementation.h"  // for shape_inference::DataValueMap
 
 namespace ONNX_NAMESPACE {
 
@@ -48,18 +49,21 @@ namespace ONNX_NAMESPACE {
 // for a genuinely unknown op), never producing incorrect information:
 //  - Function-body inference (schema->HasFunction(), for ops defined as an
 //    onnx function rather than a native op) is not implemented.
-//  - ShapeInferenceOptions::enable_data_propagation is not honored (v1
-//    always runs as if it were false); onnxsim's own callers don't set it.
 //  - Sparse tensor inputs are not fed to getInputSparseData().
-//  - No SymbolTable is threaded through, so symbolic (dim_param) shapes
-//    are not materialized/unified across a Loop's iterations the way
-//    ONNX_NAMESPACE::shape_inference::InferShapes's own SymbolTableImpl would; this
-//    only affects the *precision* of some symbolic shapes, never their
-//    correctness.
 //
 // Returns whether any value's inferred type/shape actually changed
 // anything, mirroring ONNX_NAMESPACE::shape_inference::InferShapes's
 // num_inferred_values out-param.
-bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options = ShapeInferenceOptions());
+//
+// If options.enable_data_propagation is set, out_generated_shape_data must
+// be non-null: it is populated exactly as ONNX_NAMESPACE::shape_inference::
+// InferShapes's own generated_shape_data_by_name out-param is, by running
+// each visited node's schema->GetDataPropagationFunction() (when it has one)
+// via shape_inference::DataPropagationContextImpl, right after that node's
+// ordinary type/shape inference. Left null (the default) when the caller
+// does not need partial-value propagation, matching the ModelProto-based
+// InferShapes's own opt-in shape.
+bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options = ShapeInferenceOptions(),
+                         shape_inference::DataValueMap* out_generated_shape_data = nullptr);
 
 } // namespace ONNX_NAMESPACE
