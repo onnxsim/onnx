@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,8 +19,62 @@
 
 namespace ONNX_NAMESPACE {
 
+// A per-Tensor id, lazily minted on first Get() and reset to "unassigned"
+// whenever the owning object is copied or assigned (never on move: a
+// moved-from Tensor's old id, if it was ever read, stays valid for anyone
+// still holding it). This makes it safe to key a cache off tensor_id()
+// instead of &tensor: a `Tensor*` can be freed and its memory reused by an
+// unrelated, later Tensor (e.g. after Graph::eraseInitializer, or a Node
+// attribute being replaced), which would silently alias an old cache entry
+// onto the new tensor's different content if the cache were keyed by
+// address. Two live Tensor objects never share an id while their contents
+// could independently diverge, because a copy/assignment always resets the
+// destination to "unassigned" and the next Get() mints a fresh one. See
+// onnxoptimizer/passes/tensor_content_hash.h's TensorContentDigest cache,
+// the motivating consumer (onnxsim issue #633).
+//
+// Encapsulating the reset-on-copy behavior here lets Tensor itself keep
+// fully compiler-generated special member functions: the compiler's
+// memberwise copy/move calls this class's own copy/move constructor and
+// assignment operator for the tensor_id_ member, same as for any other
+// field.
+//
+// Not atomic: Tensor construction is single-threaded throughout this
+// codebase (matching TensorContentDigest's own cache, which is likewise an
+// unsynchronized global).
+class LazyTensorId {
+ public:
+  LazyTensorId() = default;
+  LazyTensorId(const LazyTensorId&) noexcept {}
+  LazyTensorId(LazyTensorId&&) noexcept {}
+  LazyTensorId& operator=(const LazyTensorId& other) noexcept {
+    if (this != &other) {
+      id_ = 0;
+    }
+    return *this;
+  }
+  LazyTensorId& operator=(LazyTensorId&& other) noexcept {
+    if (this != &other) {
+      id_ = 0;
+    }
+    return *this;
+  }
+  uint64_t Get() const {
+    if (id_ == 0) {
+      static uint64_t counter = 0;
+      id_ = ++counter;
+    }
+    return id_;
+  }
+
+ private:
+  mutable uint64_t id_{0};
+};
+
 struct Tensor final {
  private:
+  LazyTensorId tensor_id_;
+
   bool is_segment_{false};
   int64_t segment_begin_{0};
   int64_t segment_end_{0};
@@ -42,6 +97,15 @@ struct Tensor final {
   ONNX_NAMESPACE::TensorProto_DataLocation data_location_{ONNX_NAMESPACE::TensorProto_DataLocation_DEFAULT};
 
  public:
+  // Tensor's own special member functions are all implicit: LazyTensorId's
+  // copy/move constructor and assignment operator already give tensor_id_
+  // the right behavior under the compiler-generated memberwise copy/move,
+  // same as every other field.
+
+  uint64_t tensor_id() const {
+    return tensor_id_.Get();
+  }
+
   const std::vector<int64_t>& sizes() const {
     return sizes_;
   }
