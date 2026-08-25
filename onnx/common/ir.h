@@ -1140,16 +1140,23 @@ struct Graph final {
     useName(initializer.name());
   }
 
-  // Move-taking overload: skips the copy above for a Tensor the caller is
-  // discarding. Existing lvalue call sites are unaffected.
+  // Move-taking overload. The lvalue overload above always copies
+  // initializer's fields (raw_data included) into the heap-allocated Tensor
+  // it stores; a caller whose Tensor is a scratch value it is discarding
+  // right after this call (e.g. a pass rewriting a Constant node's tensor
+  // into an initializer) can pass it as an rvalue instead and skip that
+  // copy. Existing call sites are unaffected: passing an lvalue still binds
+  // to the copying overload above, since it is a better match for an lvalue
+  // than a Tensor&& parameter.
   void addInitializer(Tensor&& initializer) {
     if (initializer.name().empty()) {
       initializer.setName(getNextUniqueName());
     }
-    // Read the name before the move below invalidates it.
+    // Read the name before the move below invalidates initializer's own
+    // fields (Tensor's move constructor moves name_ too).
     initializer_names_.push_back(initializer.name());
     useName(initializer.name());
-    initializers_.push_back(std::move(initializer));
+    initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
   }
 
   // For IR >= 4, initializer is not required to exist in input
@@ -1164,8 +1171,10 @@ struct Graph final {
     return init_value;
   }
 
-  // Move-taking counterpart to addInitializer(Tensor&&) above. Everything
-  // the returned Value needs is read before initializer is moved from.
+  // Move-taking counterpart to the addInitializer(Tensor&&) overload above --
+  // same rationale (skip the copy of raw_data / typed-data fields for a
+  // Tensor the caller is discarding). Everything the returned Value needs
+  // (name/sizes/elem_type) is read before initializer is moved from.
   Value* addInitializerAndCreateValue(Tensor&& initializer) {
     if (initializer.name().empty()) {
       initializer.setName(getNextUniqueName());
@@ -1177,7 +1186,7 @@ struct Graph final {
     init_value->setElemType(initializer.elem_type());
     initializer_names_.push_back(initializer.name());
     useName(initializer.name());
-    initializers_.push_back(std::move(initializer));
+    initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
     return init_value;
   }
 
