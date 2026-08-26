@@ -1422,6 +1422,23 @@ struct Graph final {
     forEachNodeImpl(this, fn);
   }
 
+  // Like forEachNode(), but never visits self's own top-level nodes -- only
+  // those in nested subgraphs, recursively. For a caller that only cares
+  // about nested-subgraph nodes (see below), this is a real optimization
+  // over forEachNode(), not just the same cost under a different name:
+  // forEachNode() must still visit every one of self's own nodes to honor
+  // its own (more general) "visit self too" contract, even when the caller's
+  // own callback immediately discards every one of them -- an O(graph size)
+  // cost paid for nothing when self has no subgraphs. This skips straight to
+  // hasAnySubgraphNode()'s O(1) answer in that case instead.
+  void forEachNodeInSubgraphs(const std::function<void(Node*)>& fn) {
+    forEachNodeInSubgraphsImpl(this, fn);
+  }
+
+  void forEachNodeInSubgraphs(const std::function<void(const Node*)>& fn) const {
+    forEachNodeInSubgraphsImpl(this, fn);
+  }
+
  private:
   // Whether this graph's own all_nodes (not recursing into subgraphs)
   // contains at least one node with a g/gs attribute -- memoized, since
@@ -1481,6 +1498,34 @@ struct Graph final {
     });
   }
 
+  // Same subgraph scan as forSelfAndEachSubGraphImpl above, but never calls
+  // fn(self) or visits self's own nodes -- only recurses into nested
+  // subgraphs (via forEachNodeImpl, so a subgraph found here still has its
+  // own nodes visited, and its own nested subgraphs recursed into in turn).
+  // See forEachNodeInSubgraphs()'s comment for why this exists as a
+  // separate traversal instead of forEachNode() plus a filter.
+  template <typename GraphPtr, typename Fn>
+  static void forEachNodeInSubgraphsImpl(GraphPtr self, const Fn& fn) {
+    if (!self->hasAnySubgraphNode()) {
+      return;
+    }
+    for (const auto& node_entry : self->all_nodes) {
+      const Node* node = node_entry.first;
+      if (!node->hasSubgraphAttribute()) {
+        continue;
+      }
+      for (const auto& attr : node->attributeNames()) {
+        if (node->kindOf(attr) == AttributeKind::g) {
+          forEachNodeImpl(node->g(attr).get(), fn);
+        } else if (node->kindOf(attr) == AttributeKind::gs) {
+          for (const auto& subgraph : node->gs(attr)) {
+            forEachNodeImpl(subgraph.get(), fn);
+          }
+        }
+      }
+    }
+  }
+
   // should only be called in the constructor
   Node* initOutput(Node* p) {
     p->next() = p;
@@ -1528,11 +1573,12 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
         owningGraph()->initializers_[i]->setName(name);
       }
     }
-    graph->forEachNode([this, &name, &old_name](Node* node) {
-      if (node->owningGraph() == this->owningGraph()) {
-        // skip non-subgraph
-        return;
-      }
+    // forEachNodeInSubgraphs(), not forEachNode(): this only ever cares
+    // about kCaptured placeholders in a *nested* subgraph (never a node in
+    // `graph` itself, hence no owningGraph() filter needed here anymore --
+    // forEachNodeInSubgraphs() never visits graph's own nodes to begin
+    // with).
+    graph->forEachNodeInSubgraphs([this, &name, &old_name](Node* node) {
       if (node->kind() == kCaptured) {
         Value* output = node->output();
         if (output->uniqueName() == old_name) {
@@ -1569,11 +1615,9 @@ inline void Value::replaceAllUsesWith(Value* newValue) {
     u.user->inputs_[u.offset] = newValue;
     newValue->uses_in_current_graph_.push_back(u);
   }
-  graph->forEachNode([this, &newValue, &unique_name](Node* node) {
-    if (node->owningGraph() == this->owningGraph()) {
-      // skip non-subgraph
-      return;
-    }
+  // forEachNodeInSubgraphs(), not forEachNode(): see setUniqueName()'s own
+  // comment on the same substitution.
+  graph->forEachNodeInSubgraphs([this, &newValue, &unique_name](Node* node) {
     if (node->kind() == kCaptured) {
       Value* output = node->output();
       if (output->uniqueName() == unique_name) {
@@ -1663,11 +1707,9 @@ inline const_graph_node_list_iterator Node::reverseIterator() const {
 // safe to delete a Value.
 inline use_list Value::uses() const {
   use_list all_uses = uses_in_current_graph_;
-  owningGraph()->forEachNode([this, &all_uses](const Node* node) {
-    if (node->owningGraph() == this->owningGraph()) {
-      // skip non-subgraph
-      return;
-    }
+  // forEachNodeInSubgraphs(), not forEachNode(): see setUniqueName()'s own
+  // comment on the same substitution.
+  owningGraph()->forEachNodeInSubgraphs([this, &all_uses](const Node* node) {
     if (node->kind() == kCaptured) {
       const Value* output = node->outputs()[0];
       if (output->uniqueName() == this->uniqueName()) {
