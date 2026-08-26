@@ -13,6 +13,10 @@ permissions:
   pull-requests: read
   actions: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check-label:
     runs-on: ubuntu-latest
