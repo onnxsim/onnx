@@ -9,7 +9,7 @@
 
 #include "onnx/common/ir.h"
 #include "onnx/defs/shape_inference.h"
-#include "onnx/shape_inference/implementation.h"  // for shape_inference::DataValueMap
+#include "onnx/shape_inference/implementation.h" // for shape_inference::DataValueMap
 
 namespace ONNX_NAMESPACE {
 
@@ -63,7 +63,9 @@ namespace ONNX_NAMESPACE {
 // ordinary type/shape inference. Left null (the default) when the caller
 // does not need partial-value propagation, matching the ModelProto-based
 // InferShapes's own opt-in shape.
-bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options = ShapeInferenceOptions(),
-                         shape_inference::DataValueMap* out_generated_shape_data = nullptr);
+bool InferShapesOnGraph(
+    Graph& g,
+    const ShapeInferenceOptions& options = ShapeInferenceOptions(),
+    shape_inference::DataValueMap* out_generated_shape_data = nullptr);
 
 } // namespace ONNX_NAMESPACE
