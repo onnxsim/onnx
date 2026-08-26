@@ -267,6 +267,75 @@ TEST(IR, ForEachNodeSurvivesSelfMutationDuringSubgraphWalk) {
   EXPECT_TRUE(if_node->hasAttribute(Symbol("extra_attr")));
 }
 
+// Regression test for Graph::subgraph_bearing_nodes_ (see ir.h's
+// Node::onAttributeAdded()/onAttributeRemoved()): a node that gains a
+// subgraph (g) attribute after the graph has already been walked once must
+// still be found by a later setUniqueName() call's kCaptured search. A node
+// that isn't correctly added to subgraph_bearing_nodes_ when it gains a g/gs
+// attribute would silently skip the scan and leave the captured value's name
+// out of sync with the value it captures -- corrupting, not just slowing
+// down, the subgraph's reference.
+TEST(IR, SetUniqueNamePropagatesIntoSubgraphAddedAfterFirstWalk) {
+  Graph* g = new Graph(); // NOLINT(cppcoreguidelines-owning-memory)
+  g->setName("outer");
+  Value* v = g->addInput();
+  v->setUniqueName("v0");
+  // A second setUniqueName() call is what actually exercises
+  // forEachNode()'s subgraph search (the first call has no previous name to
+  // propagate) -- the graph has no subgraph nodes yet at this point.
+  v->setUniqueName("v1");
+
+  // Now give the graph a subgraph (mimicking an If/Loop node) containing a
+  // kCaptured placeholder for v's current name -- the same construction
+  // ir_pb_converter.cc's createDummyValue() uses for a real model's
+  // captured references.
+  auto subgraph = std::make_shared<Graph>();
+  Node* captured = subgraph->create(kCaptured, 1);
+  subgraph->appendNode(captured);
+  Value* captured_value = captured->outputs()[0];
+  captured_value->setUniqueName("v1");
+
+  Node* control_flow_node = g->create(kIf, 0);
+  g->appendNode(control_flow_node);
+  control_flow_node->g_(kthen_branch, subgraph);
+
+  // If control_flow_node was correctly added to subgraph_bearing_nodes_ when
+  // the g attribute was set above, this rename must propagate into the
+  // subgraph's captured placeholder.
+  v->setUniqueName("v2");
+  EXPECT_EQ(captured_value->uniqueName(), "v2");
+}
+
+// Companion to the above: once a node's only subgraph attribute is
+// *removed*, removeAttribute() must remove it from subgraph_bearing_nodes_
+// too, so a later setUniqueName() call correctly no-ops on the now-plain
+// graph instead of (harmlessly, but as a sanity check on the removal path)
+// still recursing into the detached subgraph.
+TEST(IR, RemoveAttributeUpdatesSubgraphBearingNodes) {
+  Graph* g = new Graph(); // NOLINT(cppcoreguidelines-owning-memory)
+  g->setName("outer");
+  Value* v = g->addInput();
+  v->setUniqueName("v0");
+
+  auto subgraph = std::make_shared<Graph>();
+  Node* captured = subgraph->create(kCaptured, 1);
+  subgraph->appendNode(captured);
+  Value* captured_value = captured->outputs()[0];
+  captured_value->setUniqueName("v0");
+
+  Node* control_flow_node = g->create(kIf, 0);
+  g->appendNode(control_flow_node);
+  control_flow_node->g_(kthen_branch, subgraph);
+  v->setUniqueName("v1");
+  EXPECT_EQ(captured_value->uniqueName(), "v1");
+
+  control_flow_node->removeAttribute(kthen_branch);
+  // The graph now has no subgraphs; the outer value can still be renamed
+  // freely, and the (now-detached) captured placeholder must not change.
+  v->setUniqueName("v2");
+  EXPECT_EQ(captured_value->uniqueName(), "v1");
+}
+
 // Regression test: Tensor::elem_num() and size_from_dim() must use 64-bit
 // arithmetic. Previously, std::accumulate used `1` (int) as the initial value,
 // causing 32-bit multiplication that silently overflowed for tensors whose
