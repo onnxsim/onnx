@@ -7,6 +7,8 @@
 
 #include "onnx/common/graph_shape_inference.h"
 
+#include <google/protobuf/arena.h>
+
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -381,11 +383,31 @@ class GraphShapeInferenceRunner {
       return false;
     }
 
+    // Every protobuf message this one node visit builds -- np below plus its
+    // attribute tree (including, for If/Loop/Scan, a full subgraph body
+    // export via AddAttributeForInference) and the per-input
+    // TypeProto/TensorProto adapters further down -- lives on `arena` and is
+    // discarded when ProcessNode returns. ProcessNode runs once per node,
+    // per Run() call, and Run() is itself driven to a fixed point over the
+    // whole graph (see OptAndShapeOnGraph's FixedPointFn loop in onnxsim),
+    // so this tree is rebuilt from scratch many times per node across a
+    // typical simplification run. Without an arena, tearing one down after
+    // every visit means walking whatever sub-message tree schema authoring
+    // produced (recursively, for a node with a subgraph attribute) and
+    // freeing each piece individually; on an arena the whole tree is
+    // released in one bulk free when `arena` goes out of scope -- the same
+    // rationale as RunOps's op_model in constant_folding.cpp. Nothing
+    // allocated here is read past ProcessNode's own return:
+    // InferenceContextImpl's per-call state, GraphInferencerImpl, and the
+    // schema/data-propagation functions invoked below are all constructed
+    // and fully consumed inside this function.
+    google::protobuf::Arena arena;
+
     // A lightweight NodeProto shell: attribute conversion is the only part
     // worth sharing with the Export path (addAttribute, from
     // ir_pb_converter_internal.h), everything else here is small metadata
     // (names, counts) with no tensor bytes involved.
-    NodeProto np;
+    NodeProto& np = *google::protobuf::Arena::Create<NodeProto>(&arena);
     np.set_op_type(op_type);
     if (node.has_domain()) {
       np.set_domain(node.domain());
@@ -406,14 +428,17 @@ class GraphShapeInferenceRunner {
     }
 
     // Per-input TypeProto/TensorProto adapters, built fresh for this one
-    // node visit. InferenceContextImpl captures these pointers into its own
-    // per-call state during construction and does not use them past
-    // ProcessNode's return, so the backing vectors only need to outlive this
-    // function.
-    std::vector<TypeProto> input_types(inputs.size());
+    // node visit and arena-allocated for the same reason as `np` above:
+    // constructing a RepeatedPtrField with `&arena` makes every element
+    // Add() creates live on it too. InferenceContextImpl captures pointers
+    // into these into its own per-call state during construction and does
+    // not use them past ProcessNode's return, so the arena's lifetime
+    // (this function's scope) is all they need.
+    google::protobuf::RepeatedPtrField<TypeProto> input_types(&arena);
+    input_types.Reserve(static_cast<int>(inputs.size()));
     std::unordered_map<std::string, TypeProto*> value_types_by_name;
-    std::vector<TensorProto> input_data_storage;
-    input_data_storage.reserve(inputs.size());
+    google::protobuf::RepeatedPtrField<TensorProto> input_data_storage(&arena);
+    input_data_storage.Reserve(static_cast<int>(inputs.size()));
     std::unordered_map<std::string, const TensorProto*> input_data_by_name;
     const std::unordered_map<std::string, const SparseTensorProto*> input_sparse_data_by_name; // always empty (v1)
 
@@ -422,14 +447,15 @@ class GraphShapeInferenceRunner {
       if (input->node()->kind() == kUndefined) {
         continue; // absent optional input
       }
-      EncodeCurrentType(*input, input_types[i]);
-      value_types_by_name[input->uniqueName()] = &input_types[i];
+      TypeProto* input_type = input_types.Add();
+      EncodeCurrentType(*input, *input_type);
+      value_types_by_name[input->uniqueName()] = input_type;
 
       if (const Tensor* data = ConstantDataFor(*input, initializer_by_name)) {
         if (ElementCountFits(*data)) {
-          input_data_storage.emplace_back();
-          encodeTensor(input_data_storage.back(), *data);
-          input_data_by_name[input->uniqueName()] = &input_data_storage.back();
+          TensorProto* tp = input_data_storage.Add();
+          encodeTensor(*tp, *data);
+          input_data_by_name[input->uniqueName()] = tp;
         }
       }
     }
