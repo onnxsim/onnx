@@ -177,6 +177,11 @@ struct Attributes {
     for (const auto& i : rhs.values_) {
       values_.push_back(i->clone());
     }
+    // Bulk attribute replacement -- may have just gained or lost a g/gs
+    // attribute (e.g. copying an If/Loop node's attributes onto another
+    // node), so this can't skip the same invalidation set()/removeAttribute()
+    // below do. See Graph::invalidateSubgraphNodeCache()'s comment.
+    This()->owningGraph()->invalidateSubgraphNodeCache();
   }
   bool hasAttribute(Symbol name) const {
     return find(name, false) != values_.end();
@@ -186,6 +191,7 @@ struct Attributes {
   }
   Derived* removeAttribute(Symbol name) {
     values_.erase(find(name, true));
+    This()->owningGraph()->invalidateSubgraphNodeCache();
     return This();
   }
   bool hasAttributes() const {
@@ -252,6 +258,7 @@ struct Attributes {
     } else {
       *it = std::move(nv);
     }
+    This()->owningGraph()->invalidateSubgraphNodeCache();
     return This();
   }
   template <typename T>
@@ -945,6 +952,16 @@ struct Graph final {
   std::unordered_map<const Value*, std::unique_ptr<const Value>> all_values;
   size_t next_unique_{0};
 
+  // Memoizes hasAnySubgraphNode() below (whether this graph's own all_nodes,
+  // not recursing into subgraphs, contains a node with a g/gs attribute).
+  // `subgraph_node_cache_valid_` false means "unknown, recompute";
+  // invalidateSubgraphNodeCache() is the only writer of that -- see its own
+  // comment for why every place that can add/remove a subgraph attribute
+  // calls it. mutable: computed lazily from const-qualified callers
+  // (forSelfAndEachSubGraphImpl's const overload).
+  mutable bool subgraph_node_cache_valid_{false};
+  mutable bool has_subgraph_node_cached_{false};
+
   size_t new_node_stage_{0};
 
   // holds outputs in a way that can be reflected
@@ -1036,6 +1053,23 @@ struct Graph final {
 
  public:
   Graph() : output_(initOutput(create(kReturn, 0))), input_(create(kParam, 0)), initializer_node_(create(kParam, 0)) {}
+
+  // Called by Attributes<Derived>::set()/removeAttribute()/copyAttributes()
+  // (via Node::owningGraph()) whenever a node's attributes change in a way
+  // that could add or remove a g/gs (subgraph) attribute -- see
+  // hasAnySubgraphNode()'s comment for what this protects. Conservative: it
+  // fires on any attribute mutation, not just g/gs ones, since attribute
+  // mutation is rare relative to the hot paths (Value::uses()/
+  // setUniqueName()/replaceAllUsesWith()) this cache exists to speed up, and
+  // precisely distinguishing g/gs mutations from others isn't worth the
+  // extra coupling between Attributes and Graph. Never skip calling this
+  // when a subgraph attribute *might* have changed -- a stale "no subgraph
+  // nodes" cache would make forSelfAndEachSubGraphImpl silently skip a real
+  // subgraph (e.g. losing a kCaptured value's rename in setUniqueName), not
+  // just cost performance.
+  void invalidateSubgraphNodeCache() const {
+    subgraph_node_cache_valid_ = false;
+  }
 
   bool has_doc_string() const {
     return has_doc_string_;
@@ -1389,9 +1423,32 @@ struct Graph final {
   }
 
  private:
+  // Whether this graph's own all_nodes (not recursing into subgraphs)
+  // contains at least one node with a g/gs attribute -- memoized, since
+  // computing it is the same O(graph size) scan forSelfAndEachSubGraphImpl
+  // below always paid on every call before this cache existed. That matters
+  // at scale: Value::uses()/setUniqueName()/replaceAllUsesWith() each call
+  // forEachNode(), which starts from forSelfAndEachSubGraphImpl -- so a
+  // graph with, say, 5000 nodes and zero Loop/If/Scan subgraphs (the
+  // overwhelming common case for a real exported model) previously re-paid
+  // a 5000-entry scan on every one of those calls, an O(graph size²) cost
+  // across a whole pass, purely to conclude "no subgraphs here" each time.
+  // See invalidateSubgraphNodeCache() for how staleness is avoided.
+  bool hasAnySubgraphNode() const {
+    if (!subgraph_node_cache_valid_) {
+      has_subgraph_node_cached_ = std::any_of(
+          all_nodes.begin(), all_nodes.end(), [](const auto& entry) { return entry.first->hasSubgraphAttribute(); });
+      subgraph_node_cache_valid_ = true;
+    }
+    return has_subgraph_node_cached_;
+  }
+
   template <typename GraphPtr, typename Fn>
   static void forSelfAndEachSubGraphImpl(GraphPtr self, const Fn& fn) {
     fn(self);
+    if (!self->hasAnySubgraphNode()) {
+      return;
+    }
     for (const auto& node_entry : self->all_nodes) {
       const Node* node = node_entry.first;
       // hasSubgraphAttribute() is a cheap, non-allocating check; skip the
