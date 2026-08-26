@@ -243,8 +243,9 @@ class GraphIrSymbolTable : public SymbolTable {
 
 class GraphShapeInferenceRunner {
  public:
-  explicit GraphShapeInferenceRunner(const ShapeInferenceOptions& options,
-                                      shape_inference::DataValueMap* generated_shape_data)
+  explicit GraphShapeInferenceRunner(
+      const ShapeInferenceOptions& options,
+      shape_inference::DataValueMap* generated_shape_data)
       : options_(options), generated_shape_data_(generated_shape_data) {
     if (options_.enable_data_propagation && generated_shape_data_ == nullptr) {
       fail_shape_inference(
@@ -445,8 +446,7 @@ class GraphShapeInferenceRunner {
     std::unordered_map<std::string, const TensorProto*> input_data_by_name;
     const std::unordered_map<std::string, const SparseTensorProto*> input_sparse_data_by_name; // always empty (v1)
 
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      Value* input = inputs[i];
+    for (Value* input : inputs) {
       if (input->node()->kind() == kUndefined) {
         continue; // absent optional input
       }
@@ -549,8 +549,10 @@ class GraphShapeInferenceRunner {
 
 } // namespace
 
-bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options,
-                         shape_inference::DataValueMap* out_generated_shape_data) {
+bool InferShapesOnGraph(
+    Graph& g,
+    const ShapeInferenceOptions& options,
+    shape_inference::DataValueMap* out_generated_shape_data) {
   GraphShapeInferenceRunner runner(options, out_generated_shape_data);
   return runner.Run(g);
 }
