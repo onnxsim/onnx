@@ -243,8 +243,9 @@ class GraphIrSymbolTable : public SymbolTable {
 
 class GraphShapeInferenceRunner {
  public:
-  explicit GraphShapeInferenceRunner(const ShapeInferenceOptions& options,
-                                      shape_inference::DataValueMap* generated_shape_data)
+  explicit GraphShapeInferenceRunner(
+      const ShapeInferenceOptions& options,
+      shape_inference::DataValueMap* generated_shape_data)
       : options_(options), generated_shape_data_(generated_shape_data) {
     if (options_.enable_data_propagation && generated_shape_data_ == nullptr) {
       fail_shape_inference(
@@ -429,21 +430,23 @@ class GraphShapeInferenceRunner {
 
     // Per-input TypeProto/TensorProto adapters, built fresh for this one
     // node visit and arena-allocated for the same reason as `np` above:
-    // constructing a RepeatedPtrField with `&arena` makes every element
-    // Add() creates live on it too. InferenceContextImpl captures pointers
-    // into these into its own per-call state during construction and does
-    // not use them past ProcessNode's return, so the arena's lifetime
-    // (this function's scope) is all they need.
-    google::protobuf::RepeatedPtrField<TypeProto> input_types(&arena);
+    // every element Add() creates lives on the arena too. InferenceContextImpl
+    // captures pointers into these into its own per-call state during
+    // construction and does not use them past ProcessNode's return, so the
+    // arena's lifetime (this function's scope) is all they need.
+    // Arena::Create, not the (Arena*) constructor directly: newer protobuf
+    // deprecates constructing a RepeatedPtrField on an arena that way.
+    google::protobuf::RepeatedPtrField<TypeProto>& input_types =
+        *google::protobuf::Arena::Create<google::protobuf::RepeatedPtrField<TypeProto>>(&arena);
     input_types.Reserve(static_cast<int>(inputs.size()));
     std::unordered_map<std::string, TypeProto*> value_types_by_name;
-    google::protobuf::RepeatedPtrField<TensorProto> input_data_storage(&arena);
+    google::protobuf::RepeatedPtrField<TensorProto>& input_data_storage =
+        *google::protobuf::Arena::Create<google::protobuf::RepeatedPtrField<TensorProto>>(&arena);
     input_data_storage.Reserve(static_cast<int>(inputs.size()));
     std::unordered_map<std::string, const TensorProto*> input_data_by_name;
     const std::unordered_map<std::string, const SparseTensorProto*> input_sparse_data_by_name; // always empty (v1)
 
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      Value* input = inputs[i];
+    for (Value* input : inputs) {
       if (input->node()->kind() == kUndefined) {
         continue; // absent optional input
       }
@@ -546,8 +549,10 @@ class GraphShapeInferenceRunner {
 
 } // namespace
 
-bool InferShapesOnGraph(Graph& g, const ShapeInferenceOptions& options,
-                         shape_inference::DataValueMap* out_generated_shape_data) {
+bool InferShapesOnGraph(
+    Graph& g,
+    const ShapeInferenceOptions& options,
+    shape_inference::DataValueMap* out_generated_shape_data) {
   GraphShapeInferenceRunner runner(options, out_generated_shape_data);
   return runner.Run(g);
 }
