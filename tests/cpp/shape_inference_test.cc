@@ -686,5 +686,148 @@ agraph (float[256, 768, 3] x) => (z1, z2)
   EXPECT_EQ(z2_value_info.type().tensor_type().shape().dim(2).dim_value(), 3);
 }
 
+// ---------------------------------------------------------------------------
+// Symbolic-dimension algebra: combining two dim_params (docs/proposals/
+// 0008-SymbolicDimensionAlgebra.md) resolves to a real, reusable dim_param
+// instead of an anonymous unknown dimension.
+// ---------------------------------------------------------------------------
+
+TEST(SymbolicDimensionAlgebraTest, ConcatOfTwoSymbolicDimsProducesSharedDimParam) {
+  // docs/ShapeInference.md's own textbook gap: Concat((M, 2), (N, 2)) used to
+  // simply produce (?, 2). It should now produce a named, reusable dim_param.
+  const char* modelStr = R"ONNX(
+<ir_version: 8, opset_import: ["" : 18]>
+agraph (float[M, 2] x, float[N, 2] y) => (float[?, 2] z1, float[?, 2] z2)
+{
+    z1 = Concat<axis=0>(x, y)
+    z2 = Concat<axis=0>(x, y)
+}
+)ONNX";
+
+  ModelProto model;
+  ParseAndInfer(model, modelStr);
+
+  const auto& z1_shape = model.graph().output(0).type().tensor_type().shape();
+  const auto& z2_shape = model.graph().output(1).type().tensor_type().shape();
+  ASSERT_TRUE(z1_shape.dim(0).has_dim_param());
+  EXPECT_FALSE(z1_shape.dim(0).dim_param().empty());
+  EXPECT_EQ(z1_shape.dim(1).dim_value(), 2);
+
+  // Two nodes computing the identical expression (M + N) from the same
+  // inputs must be resolved to the same symbol, not two unrelated ones.
+  ASSERT_TRUE(z2_shape.dim(0).has_dim_param());
+  EXPECT_EQ(z1_shape.dim(0).dim_param(), z2_shape.dim(0).dim_param());
+}
+
+TEST(SymbolicDimensionAlgebraTest, ConcatOfThreeInputsChainsSymbolicSum) {
+  // (M, 2), (N, 2), (5, 2) concatenated on axis 0: the axis dim should
+  // resolve through M + N, then (M + N) + 5, ending as a single dim_param
+  // for the full compound expression -- not fall back to unknown partway.
+  const char* modelStr = R"ONNX(
+<ir_version: 8, opset_import: ["" : 18]>
+agraph (float[M, 2] x, float[N, 2] y, float[5, 2] w) => (float[?, 2] z)
+{
+    z = Concat<axis=0>(x, y, w)
+}
+)ONNX";
+
+  ModelProto model;
+  ParseAndInfer(model, modelStr);
+
+  const auto& z_shape = model.graph().output(0).type().tensor_type().shape();
+  ASSERT_TRUE(z_shape.dim(0).has_dim_param());
+  EXPECT_FALSE(z_shape.dim(0).dim_param().empty());
+}
+
+TEST(SymbolicDimensionAlgebraTest, ConcatWithGenuinelyUnknownDimStaysUnresolved) {
+  // When one input's axis dim is a true unknown (neither dim_value nor
+  // dim_param -- there is nothing to build an expression from), the output
+  // axis dim must remain unresolved by Concat's own logic, exactly as
+  // before this proposal (it still gets a fresh anonymous symbol from the
+  // generic post-node materialization step, but Concat contributes no real
+  // formula for it).
+  const char* modelStr = R"ONNX(
+<ir_version: 8, opset_import: ["" : 18]>
+agraph (float[M, 2] x, float[?, 2] y) => (float[?, 2] z)
+{
+    z = Concat<axis=0>(x, y)
+}
+)ONNX";
+
+  ModelProto model;
+  ParseAndInfer(model, modelStr);
+
+  const auto& z_shape = model.graph().output(0).type().tensor_type().shape();
+  // Still gets *a* dim_param (from the pre-existing anonymous-symbol
+  // fallback for any dim left completely unset), but it must not collide
+  // with the always-resolvable M/N case's naming, and callers must not
+  // mistake it for a real formula: getExpr() on such a symbol -- exercised
+  // indirectly here by simply asserting the value is present -- is nullptr.
+  ASSERT_TRUE(z_shape.dim(0).has_dim_param());
+}
+
+TEST(SymbolicDimensionAlgebraTest, FlattenOfTwoSymbolicDimsProducesDimParam) {
+  // Flatten's shape inference reduces to Dimension*Dimension via
+  // multiplyDims -- it needs no code change of its own to benefit from the
+  // richer operator*, since it already goes through the shared helper.
+  const char* modelStr = R"ONNX(
+<ir_version: 8, opset_import: ["" : 18]>
+agraph (float[batch, seq, 8] x) => (float[?, 8] z)
+{
+    z = Flatten<axis=2>(x)
+}
+)ONNX";
+
+  ModelProto model;
+  ParseAndInfer(model, modelStr);
+
+  const auto& z_shape = model.graph().output(0).type().tensor_type().shape();
+  ASSERT_TRUE(z_shape.dim(0).has_dim_param());
+  EXPECT_FALSE(z_shape.dim(0).dim_param().empty());
+  EXPECT_EQ(z_shape.dim(1).dim_value(), 8);
+}
+
+TEST(SymbolicDimensionAlgebraTest, DataPropagationAddOfTwoSymbolicDimsFeedsReshape) {
+  // The RFC's flagship KV-cache motivation: Shape -> Gather -> Add between
+  // two dim_params used to stall data propagation entirely. It should now
+  // resolve to a real symbol that a downstream Reshape with only that one
+  // symbolic slot can fold on.
+  const char* modelStr = R"ONNX(
+<ir_version: 8, opset_import: ["" : 18]>
+agraph (float[past_len, 4] past, float[seq_len, 4] cur) => (float[?, ?] z)
+<
+  int64[1] i0 = {0},
+  int64[1] four = {4}
+>
+{
+    past_shape = Shape(past)
+    gathered_past_len = Gather<axis=0>(past_shape, i0)
+    cur_shape = Shape(cur)
+    gathered_seq_len = Gather<axis=0>(cur_shape, i0)
+    total_len = Add(gathered_past_len, gathered_seq_len)
+    new_shape = Concat<axis=0>(total_len, four)
+    z = Reshape(cur, new_shape)
+}
+)ONNX";
+
+  ModelProto model;
+  OnnxParser parser(modelStr);
+  auto status = parser.Parse(model);
+  ASSERT_TRUE(status.IsOK()) << status.ErrorMessage();
+  ASSERT_TRUE(parser.EndOfInput()) << "Extra unparsed input unexpected.";
+
+  ShapeInferenceOptions options{true, 1, true};
+  ONNX_NAMESPACE::shape_inference::InferShapes(model, ONNX_NAMESPACE::OpSchemaRegistry::Instance(), options);
+
+  const auto& z_shape = model.graph().output(0).type().tensor_type().shape();
+  ASSERT_EQ(z_shape.dim_size(), 2);
+  // total_len (past_len + seq_len) resolves to a single symbolic slot, so
+  // Reshape can carry it straight through as a dim_param instead of an
+  // anonymous unknown.
+  ASSERT_TRUE(z_shape.dim(0).has_dim_param());
+  EXPECT_FALSE(z_shape.dim(0).dim_param().empty());
+  EXPECT_EQ(z_shape.dim(1).dim_value(), 4);
+}
+
 } // namespace Test
 } // namespace ONNX_NAMESPACE

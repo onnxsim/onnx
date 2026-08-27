@@ -58,18 +58,31 @@ dynamic behaviors block the flow of shape inference, for example a
 Reshape to a dynamically-provide shape. Also, all operators are not
 required to have a shape inference implementation.
 
-Shape inference works only with constants and simple variables. It
-does not support arithmetic expressions containing variables. For
-example, `Concat` on tensors of shapes `(5, 2)` and `(7, 2)` can be
-inferred to produce a result of shape `(12, 2)`, but `Concat` on
-tensors of shapes `(5, 2)` and `(N, 2)` will simply produce `(M, 2)`,
-rather than containing a representation of `N+5`. Note that differing
-unknown symbolic values will be propagated, so the `M` here represents
-an unknown quantity that is the same as other occurrences of `M`.
+Shape inference supports simple polynomial arithmetic (sums and
+products of an integer-coefficient) over symbolic dimensions, but
+nothing more general than that -- no `floor`/`ceil`/`min`/`max`, no
+rational functions, no inequality reasoning. For example, `Concat` on
+tensors of shapes `(5, 2)` and `(7, 2)` can be inferred to produce a
+result of shape `(12, 2)`, and `Concat` on tensors of shapes `(M, 2)`
+and `(N, 2)` now produces `(M+N, 2)`: a fresh, reusable symbol that
+shape inference records as standing for the polynomial `M+N`, rather
+than an anonymous unknown dimension unrelated to `M` and `N`. Two
+dimensions that reduce to the *same* polynomial -- however they arrive,
+and wherever in the graph -- are recognized as equal and share that one
+symbol. This also applies to partial data propagation
+(`ShapeInferenceOptions.enable_data_propagation`): a `Shape -> Gather ->
+Add -> Concat -> Reshape` chain now resolves fully even when the `Add`
+combines two symbolic dimensions (e.g. a KV-cache decoder's `past_len +
+seq_len`), rather than stalling the moment the chain stops involving a
+concrete value.
 
-These limitations are a property of the current implementation, not
-fundamental constraints - if you are in need of something more
-advanced, do let us know!
+This is still a real limitation, not full symbolic execution: an
+expression outside this narrow polynomial algebra (or a dimension that
+is genuinely unknown, with neither a `dim_value` nor a `dim_param` to
+build an expression from) still falls back to an anonymous unknown
+dimension exactly as before. These limitations are a property of the
+current implementation, not fundamental constraints - if you are in
+need of something more advanced, do let us know!
 
 ## Type Inference vs. Shape Inference
 

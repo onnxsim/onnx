@@ -545,8 +545,13 @@ ONNX_OPERATOR_SET_SCHEMA(
             return;
           }
 
-          bool all_lengths_known = true;
-          int64_t total_length = 0;
+          // Accumulated via Dimension's own addition, rather than a plain
+          // int64_t total plus a has-any-input-been-unknown-so-far flag, so
+          // that combining two symbolic axis lengths (e.g. `M` and `N`) can
+          // resolve to a real, reusable `M + N` dim_param instead of always
+          // degrading straight to an unknown output dimension.
+          TensorShapeProto::Dimension total_length;
+          total_length.set_dim_value(0);
 
           auto output_shape = ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
 
@@ -562,17 +567,11 @@ ONNX_OPERATOR_SET_SCHEMA(
             }
             for (int j = 0; j < rank; j++) {
               if (j == axis) {
-                if (shape.dim(j).has_dim_value()) {
-                  const int64_t dim_val = shape.dim(j).dim_value();
-                  if (dim_val < 0) {
-                    fail_shape_inference("Negative dimension value on Concat axis");
-                  }
-                  if (checked_add_overflow(total_length, dim_val, &total_length)) {
-                    fail_shape_inference("Integer overflow computing Concat output length");
-                  }
-                } else {
-                  all_lengths_known = false;
+                const auto& input_dim = shape.dim(j);
+                if (input_dim.has_dim_value() && input_dim.dim_value() < 0) {
+                  fail_shape_inference("Negative dimension value on Concat axis");
                 }
+                total_length = total_length + input_dim;
               } else {
                 auto& output_dim = *output_shape->mutable_dim(j);
                 const auto& input_dim = shape.dim(j);
@@ -581,8 +580,8 @@ ONNX_OPERATOR_SET_SCHEMA(
             }
           }
 
-          if (all_lengths_known) {
-            output_shape->mutable_dim(axis)->set_dim_value(total_length);
+          if (total_length.has_dim_value() || total_length.has_dim_param()) {
+            *output_shape->mutable_dim(axis) = total_length;
           }
         })
         .PartialDataPropagationFunction([](DataPropagationContext& ctx) {

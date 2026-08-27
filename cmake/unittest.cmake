@@ -17,6 +17,7 @@ set(test_src
     ${ONNX_ROOT}/tests/cpp/safe_math_test.cc
     ${ONNX_ROOT}/tests/cpp/schema_registration_test.cc
     ${ONNX_ROOT}/tests/cpp/shape_inference_test.cc
+    ${ONNX_ROOT}/tests/cpp/symbolic_expr_test.cc
     ${ONNX_ROOT}/tests/cpp/tensor_test.cc
     ${ONNX_ROOT}/tests/cpp/test_main.cc
     ${ONNX_ROOT}/tests/cpp/utf8_conversion_test.cc

@@ -157,6 +157,45 @@ class TestDataPropagation(TestShapeInferenceHelper):
             data_prop=True,
         )
 
+    def test_shape_arithmetic_symbolic(self) -> None:
+        """RFC 0008 (docs/proposals/0008-SymbolicDimensionAlgebra.md)'s
+        flagship motivation: adding two symbolic per-axis shape values (e.g.
+        a KV-cache decoder's `past_len + seq_len`) used to simply drop that
+        axis as unknown data; it should now resolve to a real, reusable
+        dim_param that a downstream consumer (here, ConstantOfShape) can
+        carry through instead of losing.
+        """
+        graph = self._make_graph(
+            [
+                ("x", TensorProto.FLOAT, ("M", 4, 5)),
+                ("y", TensorProto.FLOAT, ("N", 2, 3)),
+            ],
+            [
+                make_node("Shape", ["x"], ["xshape"]),
+                make_node("Shape", ["y"], ["yshape"]),
+                make_node("Add", ["xshape", "yshape"], ["zshape"]),
+                make_node(
+                    "ConstantOfShape",
+                    ["zshape"],
+                    ["z"],
+                    value=make_tensor("value", TensorProto.INT32, (1,), (2,)),
+                ),
+            ],
+            [],
+        )
+        inferred_model = self._inferred(graph, data_prop=True)
+        value_infos = {
+            vi.name: vi
+            for vi in (*inferred_model.graph.value_info, *inferred_model.graph.output)
+        }
+        z_shape = value_infos["z"].type.tensor_type.shape
+        assert len(z_shape.dim) == 3
+        # M + N (the two axis-0 sizes, both symbolic) resolves to a real,
+        # named dim_param instead of an unresolved axis.
+        assert z_shape.dim[0].dim_param, f"{inferred_model}"
+        assert z_shape.dim[1].dim_value == 6
+        assert z_shape.dim[2].dim_value == 8
+
     def test_shape_arithmetic_with_broadcast(self) -> None:
         graph = self._make_graph(
             [("x", TensorProto.FLOAT, (3, 4, 5)), ("y", TensorProto.FLOAT, (3,))],

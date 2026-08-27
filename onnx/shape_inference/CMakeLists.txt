@@ -5,4 +5,5 @@ target_sources(onnx PRIVATE
     attribute_binder.h
     implementation.cc
     implementation.h
+    symbolic_expr.h
 )

@@ -38,6 +38,15 @@ static void MathOpDataPropagator(DataPropagationContext& ctx, const std::string&
     if (input_dim_0.has_dim_value() && input_dim_1.has_dim_value()) {
       tsp.mutable_dim()->Add()->set_dim_value(
           defs::math::utils::MathOpTwoIntegers(op_type, input_dim_0.dim_value(), input_dim_1.dim_value()));
+    } else if (op_type == "Add") {
+      // Combining two symbolic dims (e.g. the `past_len + seq_len` of a
+      // KV-cache decoder's causal-mask length) can now resolve to a real,
+      // reusable dim_param instead of always giving up below.
+      *tsp.mutable_dim()->Add() = input_dim_0 + input_dim_1;
+    } else if (op_type == "Sub") {
+      *tsp.mutable_dim()->Add() = input_dim_0 - input_dim_1;
+    } else if (op_type == "Mul") {
+      *tsp.mutable_dim()->Add() = input_dim_0 * input_dim_1;
     } else {
       // Cannot compute the value; simply add an empty dim without value and param
       tsp.mutable_dim()->Add();

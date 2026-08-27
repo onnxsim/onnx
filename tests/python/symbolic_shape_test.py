@@ -160,6 +160,73 @@ class TestSymbolicShape:
         # inferred: {'unk_0', 'unk__1', 'unk__2', 'unk__3'}
         assert inferred_count == original_count + 2, f"{inferred_model}{onnx_model}"
 
+    def test_concat_of_two_symbolic_dims_shares_symbol(self) -> None:
+        """Concat(("M", 2), ("N", 2)) on axis 0 used to simply produce
+        (None, 2) -- symbolic-dimension algebra
+        (docs/proposals/0008-SymbolicDimensionAlgebra.md) lets it resolve to
+        a real, reusable dim_param for M + N instead.
+        """
+        concat1 = helper.make_node(
+            "Concat", inputs=["x", "y"], outputs=["z1"], name="Concat1", axis=0
+        )
+        concat2 = helper.make_node(
+            "Concat", inputs=["x", "y"], outputs=["z2"], name="Concat2", axis=0
+        )
+        graph_def = helper.make_graph(
+            name="test_graph",
+            nodes=[concat1, concat2],
+            inputs=[
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, ["M", 2]),
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, ["N", 2]),
+            ],
+            outputs=[
+                helper.make_tensor_value_info("z1", TensorProto.FLOAT, [None, 2]),
+                helper.make_tensor_value_info("z2", TensorProto.FLOAT, [None, 2]),
+            ],
+        )
+
+        onnx_model = make_model(graph_def)
+        inferred_model = onnx.shape_inference.infer_shapes(onnx_model, strict_mode=True)
+        self._assert_valueinfo_shape(
+            inferred_model,
+            [
+                make_tensor_value_info("z1", TensorProto.FLOAT, (-1, 2)),
+                make_tensor_value_info("z2", TensorProto.FLOAT, (-1, 2)),
+            ],
+        )
+        # Both Concat nodes compute the identical expression (M + N) from the
+        # same inputs, so they must resolve to the same symbol.
+        assert self._get_shape_from_name(
+            inferred_model, "z1"
+        ) == self._get_shape_from_name(inferred_model, "z2")
+
+    def test_flatten_of_two_symbolic_dims(self) -> None:
+        """Flatten needs no code change of its own: its shape inference
+        reduces to Dimension*Dimension via multiplyDims, so it benefits from
+        symbolic-dimension algebra purely through the shared operator*.
+        """
+        flatten = helper.make_node(
+            "Flatten", inputs=["x"], outputs=["y"], name="Flatten", axis=2
+        )
+        graph_def = helper.make_graph(
+            name="test_graph",
+            nodes=[flatten],
+            inputs=[
+                helper.make_tensor_value_info(
+                    "x", TensorProto.FLOAT, ["batch", "seq", 8]
+                ),
+            ],
+            outputs=[
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, [None, 8]),
+            ],
+        )
+
+        onnx_model = make_model(graph_def)
+        inferred_model = onnx.shape_inference.infer_shapes(onnx_model, strict_mode=True)
+        self._assert_valueinfo_shape(
+            inferred_model, [make_tensor_value_info("y", TensorProto.FLOAT, (-1, 8))]
+        )
+
     def test_unknown_shape(self) -> None:
         concat = helper.make_node(
             "Concat", inputs=["A", "B"], outputs=["C"], name="Concat", axis=1

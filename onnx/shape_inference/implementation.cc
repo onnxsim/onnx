@@ -507,6 +507,13 @@ class ShapeInferenceImplBase {
         &graph_inference_context,
         &unbound_value_names);
 
+    // Makes `symbol_table` reachable to free-function Dimension arithmetic
+    // (operator+/-/* in shape_inference.h) for the duration of this node's
+    // inference and data-propagation calls below, so that combining two
+    // symbolic dims (e.g. `M + N`) can mint/reuse a real dim_param instead
+    // of leaving the result unknown.
+    ActiveSymbolTableGuard symbol_table_guard(symbol_table);
+
     ONNX_TRY {
       if (schema) {
         if (schema->has_type_and_shape_inference_function()) {

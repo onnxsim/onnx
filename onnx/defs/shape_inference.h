@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "onnx/common/common.h"
 #include "onnx/common/safe_math.h"
 #include "onnx/proto_utils.h"
+#include "onnx/shape_inference/symbolic_expr.h"
 #include "onnx/string_utils.h"
 
 namespace ONNX_NAMESPACE {
@@ -47,7 +49,67 @@ class SymbolTable {
     return createNew("unk__");
   }
   virtual std::string createNew(const std::string& symbol_prefix) = 0;
+
+  // Returns the dim_param that denotes the symbolic-dimension expression
+  // `expr` (e.g. the result of combining two dim_params, such as `M + N`),
+  // reusing the same symbol for repeated occurrences of the same polynomial
+  // rather than minting a fresh one every time. `expr` is expected to be
+  // non-constant and not reducible to a single bare symbol -- callers handle
+  // both of those cases themselves (see MaterializeSymbolicExpr below)
+  // without needing this lookup at all.
+  //
+  // The default implementation mints a fresh symbol per call, i.e. it does
+  // not deduplicate; this keeps existing SymbolTable subclasses (outside
+  // this file) source- and binary-compatible. SymbolTableImpl overrides this
+  // together with getExpr() to provide real deduplication.
+  virtual std::string getOrCreateSymbol(const SymbolicExpr& /*expr*/) {
+    return createNew();
+  }
+
+  // Returns the expression that a previously-getOrCreateSymbol-minted
+  // compound symbol stands for, or nullptr if `symbol` is not one (e.g. an
+  // author-declared dim_param, or a plain anonymous unknown-dim symbol).
+  virtual const SymbolicExpr* getExpr(const std::string& /*symbol*/) const {
+    return nullptr;
+  }
+
   virtual ~SymbolTable() = default;
+};
+
+namespace internal {
+// The SymbolTable belonging to the shape-inference pass currently running on
+// this thread, consulted by symbolic-dimension algebra below to mint/reuse
+// dim_params for expressions combining two dim_params. nullptr outside of a
+// graph-level inference pass (e.g. a test calling a single op's inference
+// function directly) -- in that case, symbolic-dimension algebra falls back
+// to the pre-existing behavior of leaving such a combination unknown.
+inline SymbolTable*& ActiveSymbolTableSlot() {
+  static thread_local SymbolTable* table = nullptr;
+  return table;
+}
+} // namespace internal
+
+inline SymbolTable* GetActiveSymbolTable() {
+  return internal::ActiveSymbolTableSlot();
+}
+
+// RAII scope guard installing `table` (possibly nullptr) as the active
+// symbol table for the lifetime of the guard, restoring the previous value
+// on exit -- so nested/recursive shape inference (e.g. a function-body call)
+// composes correctly.
+class ActiveSymbolTableGuard final {
+ public:
+  explicit ActiveSymbolTableGuard(SymbolTable* table) : previous_(internal::ActiveSymbolTableSlot()) {
+    internal::ActiveSymbolTableSlot() = table;
+  }
+  ActiveSymbolTableGuard(const ActiveSymbolTableGuard&) = delete;
+  ActiveSymbolTableGuard& operator=(const ActiveSymbolTableGuard&) = delete;
+  ~ActiveSymbolTableGuard() {
+    internal::ActiveSymbolTableSlot() = previous_;
+  }
+
+ private:
+  SymbolTable* previous_;
 };
 
 class GraphInferencer {
@@ -247,16 +309,116 @@ inline int64_t checkedDivide(int64_t dividend, int64_t divisor) {
   return dividend / divisor;
 }
 
+// Views a Dimension as a SymbolicExpr for symbolic-dimension algebra:
+// a dim_value is a constant expression; a dim_param looks itself up in the
+// active SymbolTable's expression side-table (so an already-compound symbol,
+// e.g. one standing for `M + N`, composes correctly into a larger
+// expression), defaulting to a bare `SymbolicExpr::Symbol(name)` when it
+// isn't one. Returns nullopt for a genuine unknown dimension (neither
+// dim_value nor dim_param set) -- there is nothing to build an expression
+// from, so callers fall back to producing an unknown result, exactly as
+// before this dimension gained algebra.
+inline std::optional<SymbolicExpr> TryToSymbolicExpr(
+    const TensorShapeProto::Dimension& dim,
+    const SymbolTable* symbol_table) {
+  if (dim.has_dim_value()) {
+    return SymbolicExpr(dim.dim_value());
+  }
+  if (dim.has_dim_param()) {
+    if (symbol_table != nullptr) {
+      if (const SymbolicExpr* known = symbol_table->getExpr(dim.dim_param())) {
+        return *known;
+      }
+    }
+    return SymbolicExpr::Symbol(dim.dim_param());
+  }
+  return std::nullopt;
+}
+
+// The inverse of TryToSymbolicExpr: turns a combined expression back into a
+// Dimension. A constant expression becomes dim_value. An expression that is
+// nothing more than one pre-existing symbol (e.g. the result of `0 + M`)
+// becomes that same dim_param, rather than minting a redundant new symbol
+// for it. Any other (compound) expression is looked up/registered as a
+// fresh, reusable dim_param via `symbol_table`, so that two occurrences of
+// the same polynomial -- however they arrived, and wherever in the graph --
+// share one symbol. Without an active symbol_table, a compound expression
+// cannot be named and the dimension is left unknown, matching the behavior
+// dimension arithmetic had before it could represent this expression at all.
+inline TensorShapeProto::Dimension MaterializeSymbolicExpr(const SymbolicExpr& expr, SymbolTable* symbol_table) {
+  TensorShapeProto::Dimension result;
+  if (expr.IsConstant()) {
+    result.set_dim_value(expr.ConstantValue());
+    return result;
+  }
+  if (const std::string* bare_symbol = expr.AsBareSymbol()) {
+    result.set_dim_param(*bare_symbol);
+    return result;
+  }
+  if (symbol_table != nullptr) {
+    result.set_dim_param(symbol_table->getOrCreateSymbol(expr));
+  }
+  return result;
+}
+
 inline TensorShapeProto::Dimension operator*(
     const TensorShapeProto::Dimension& dim1,
     const TensorShapeProto::Dimension& dim2) {
   TensorShapeProto::Dimension result;
   if (dim1.has_dim_value() && dim2.has_dim_value()) {
     result.set_dim_value(checkedMultiply(dim1.dim_value(), dim2.dim_value()));
+    return result;
   } else if (dim1.has_dim_value() && (dim1.dim_value() == 1)) {
     return dim2;
   } else if (dim2.has_dim_value() && (dim2.dim_value() == 1)) {
     return dim1;
+  }
+  SymbolTable* symbol_table = GetActiveSymbolTable();
+  auto expr1 = TryToSymbolicExpr(dim1, symbol_table);
+  auto expr2 = TryToSymbolicExpr(dim2, symbol_table);
+  if (expr1.has_value() && expr2.has_value()) {
+    return MaterializeSymbolicExpr((*expr1) * (*expr2), symbol_table);
+  }
+  return result;
+}
+
+// Combines two dims by addition: `dim_value + dim_value` sums as before;
+// otherwise, if both dims are representable as symbolic-dimension
+// expressions (see TryToSymbolicExpr), the result is `expr1 + expr2`,
+// materialized back into a Dimension (a fresh, reusable dim_param when the
+// sum is a genuine compound expression, e.g. `M + N`). Otherwise the result
+// is left unknown, exactly as plain dimension addition always has been.
+inline TensorShapeProto::Dimension operator+(
+    const TensorShapeProto::Dimension& dim1,
+    const TensorShapeProto::Dimension& dim2) {
+  TensorShapeProto::Dimension result;
+  if (dim1.has_dim_value() && dim2.has_dim_value()) {
+    result.set_dim_value(checkedAdd(dim1.dim_value(), dim2.dim_value()));
+    return result;
+  }
+  SymbolTable* symbol_table = GetActiveSymbolTable();
+  auto expr1 = TryToSymbolicExpr(dim1, symbol_table);
+  auto expr2 = TryToSymbolicExpr(dim2, symbol_table);
+  if (expr1.has_value() && expr2.has_value()) {
+    return MaterializeSymbolicExpr((*expr1) + (*expr2), symbol_table);
+  }
+  return result;
+}
+
+// As operator+, but for subtraction.
+inline TensorShapeProto::Dimension operator-(
+    const TensorShapeProto::Dimension& dim1,
+    const TensorShapeProto::Dimension& dim2) {
+  TensorShapeProto::Dimension result;
+  if (dim1.has_dim_value() && dim2.has_dim_value()) {
+    result.set_dim_value(checkedSubtract(dim1.dim_value(), dim2.dim_value()));
+    return result;
+  }
+  SymbolTable* symbol_table = GetActiveSymbolTable();
+  auto expr1 = TryToSymbolicExpr(dim1, symbol_table);
+  auto expr2 = TryToSymbolicExpr(dim2, symbol_table);
+  if (expr1.has_value() && expr2.has_value()) {
+    return MaterializeSymbolicExpr((*expr1) - (*expr2), symbol_table);
   }
   return result;
 }

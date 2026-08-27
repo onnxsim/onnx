@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,11 @@ class SymbolTableImpl : public SymbolTable {
  public:
   SymbolTableImpl() = default;
 
+  // Un-hides SymbolTable::createNew() (the no-prefix-argument overload),
+  // which would otherwise be hidden by this class's own createNew(prefix)
+  // override below.
+  using SymbolTable::createNew;
+
   void addFromGraph(const GraphProto& g) override {
     AddExistingSymbolicDims(g.input());
     AddExistingSymbolicDims(g.output());
@@ -46,9 +52,30 @@ class SymbolTableImpl : public SymbolTable {
     return newSymbol;
   }
 
+  // Reuses the same dim_param for repeated occurrences of the same symbolic
+  // dimension expression (e.g. two independently-derived `M + N`s), rather
+  // than minting a fresh, unrelated symbol each time.
+  std::string getOrCreateSymbol(const SymbolicExpr& expr) override {
+    auto it = expr_to_symbol_.find(expr);
+    if (it != expr_to_symbol_.end()) {
+      return it->second;
+    }
+    std::string symbol = createNew();
+    expr_to_symbol_.emplace(expr, symbol);
+    symbol_to_expr_.emplace(symbol, expr);
+    return symbol;
+  }
+
+  const SymbolicExpr* getExpr(const std::string& symbol) const override {
+    auto it = symbol_to_expr_.find(symbol);
+    return it == symbol_to_expr_.end() ? nullptr : &it->second;
+  }
+
  private:
   unsigned int index_{0};
   std::unordered_set<std::string> existing_symbols;
+  std::map<SymbolicExpr, std::string> expr_to_symbol_;
+  std::unordered_map<std::string, SymbolicExpr> symbol_to_expr_;
 
   // TypeProto_Tensor or TypeProto_SparseTensor
   template <typename TensorTypeProto>
