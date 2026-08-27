@@ -34,6 +34,7 @@ def infer_shapes(
     check_type: bool = False,
     strict_mode: bool = False,
     data_prop: bool = False,
+    enable_symbolic_dimension_algebra: bool = True,
 ) -> ModelProto:
     """Apply shape inference to the provided ModelProto.
 
@@ -49,6 +50,12 @@ def infer_shapes(
         strict_mode: Stricter shape inference, it will throw errors if any;
             Otherwise, simply stop if any error.
         data_prop: Enables data propagation for limited operators to perform shape computation.
+        enable_symbolic_dimension_algebra: Resolve arithmetic combinations of two
+            symbolic dimensions (e.g. ``M + N``) to a real, reusable dim_param
+            instead of an anonymous unknown dimension. On by default; set to
+            False to fall back to the older, less-complete behavior, e.g. as a
+            workaround if a specific downstream consumer mishandles the extra
+            resolved dimensions.
 
     Returns:
         (ModelProto) model with inferred shape information
@@ -56,7 +63,11 @@ def infer_shapes(
     if isinstance(model, (ModelProto, bytes)):
         model_str = model if isinstance(model, bytes) else model.SerializeToString()
         inferred_model_str = C.infer_shapes(
-            model_str, check_type, strict_mode, data_prop
+            model_str,
+            check_type,
+            strict_mode,
+            data_prop,
+            enable_symbolic_dimension_algebra,
         )
         return onnx.load_from_string(inferred_model_str)
     if isinstance(model, (str, os.PathLike)):
@@ -76,6 +87,7 @@ def infer_shapes_path(
     check_type: bool = False,
     strict_mode: bool = False,
     data_prop: bool = False,
+    enable_symbolic_dimension_algebra: bool = True,
 ) -> None:
     """Take model path for shape_inference.
 
@@ -105,7 +117,14 @@ def infer_shapes_path(
 
     if output_path == "":
         output_path = model_path
-    C.infer_shapes_path(model_path, output_path, check_type, strict_mode, data_prop)
+    C.infer_shapes_path(
+        model_path,
+        output_path,
+        check_type,
+        strict_mode,
+        data_prop,
+        enable_symbolic_dimension_algebra,
+    )
 
 
 def infer_node_outputs(

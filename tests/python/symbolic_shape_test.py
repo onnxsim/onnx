@@ -200,6 +200,52 @@ class TestSymbolicShape:
             inferred_model, "z1"
         ) == self._get_shape_from_name(inferred_model, "z2")
 
+    def test_concat_of_two_symbolic_dims_disabled_flag_does_not_share_symbol(
+        self,
+    ) -> None:
+        """enable_symbolic_dimension_algebra=False is the off switch
+        (docs/proposals/0008-SymbolicDimensionAlgebra.md): with it, two
+        Concat nodes computing the identical M + N expression fall back to
+        the pre-existing behavior of two unrelated anonymous symbols,
+        instead of resolving to (and sharing) one real dim_param.
+        """
+        concat1 = helper.make_node(
+            "Concat", inputs=["x", "y"], outputs=["z1"], name="Concat1", axis=0
+        )
+        concat2 = helper.make_node(
+            "Concat", inputs=["x", "y"], outputs=["z2"], name="Concat2", axis=0
+        )
+        graph_def = helper.make_graph(
+            name="test_graph",
+            nodes=[concat1, concat2],
+            inputs=[
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, ["M", 2]),
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, ["N", 2]),
+            ],
+            outputs=[
+                helper.make_tensor_value_info("z1", TensorProto.FLOAT, [None, 2]),
+                helper.make_tensor_value_info("z2", TensorProto.FLOAT, [None, 2]),
+            ],
+        )
+
+        onnx_model = make_model(graph_def)
+        inferred_model = onnx.shape_inference.infer_shapes(
+            onnx_model, strict_mode=True, enable_symbolic_dimension_algebra=False
+        )
+        self._assert_valueinfo_shape(
+            inferred_model,
+            [
+                make_tensor_value_info("z1", TensorProto.FLOAT, (-1, 2)),
+                make_tensor_value_info("z2", TensorProto.FLOAT, (-1, 2)),
+            ],
+        )
+        # With the feature off, each Concat's unresolved axis falls back to
+        # its own unrelated anonymous symbol, exactly as before this
+        # proposal -- they must NOT be recognized as the same expression.
+        assert self._get_shape_from_name(
+            inferred_model, "z1"
+        ) != self._get_shape_from_name(inferred_model, "z2")
+
     def test_flatten_of_two_symbolic_dims(self) -> None:
         """Flatten needs no code change of its own: its shape inference
         reduces to Dimension*Dimension via multiplyDims, so it benefits from

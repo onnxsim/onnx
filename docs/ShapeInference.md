@@ -80,7 +80,23 @@ This is still a real limitation, not full symbolic execution: an
 expression outside this narrow polynomial algebra (or a dimension that
 is genuinely unknown, with neither a `dim_value` nor a `dim_param` to
 build an expression from) still falls back to an anonymous unknown
-dimension exactly as before. These limitations are a property of the
+dimension exactly as before.
+
+Symbolic-dimension algebra is on by default -- `ShapeInferenceOptions`
+(`enable_symbolic_dimension_algebra`, and the same-named keyword
+argument on `onnx.shape_inference.infer_shapes`/`infer_shapes_path`)
+lets you turn it off. It can only ever resolve *more* dimensions than
+before, never contradict a value shape inference would otherwise have
+produced, so there is no correctness reason to disable it; the flag
+exists as a workaround for a downstream consumer whose own bug is
+triggered by seeing fewer anonymous unknown dimensions and more
+resolved/shared symbols than it used to (for example, code that
+assumed two differently-named dimensions could never turn out to share
+a symbol). Turning it off reverts exactly to the pre-existing
+behavior described above -- an anonymous, unrelated unknown dimension
+for every such combination -- while that consumer gets fixed.
+
+These limitations are a property of the
 current implementation, not fundamental constraints - if you are in
 need of something more advanced, do let us know!
 

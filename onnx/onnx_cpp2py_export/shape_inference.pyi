@@ -29,7 +29,11 @@ class InferenceContext:
     def get_display_name(self) -> str: ...
 
 def infer_shapes(
-    b: bytes, check_type: bool, strict_mode: bool, data_prop: bool
+    b: bytes,
+    check_type: bool,
+    strict_mode: bool,
+    data_prop: bool,
+    enable_symbolic_dimension_algebra: bool,
 ) -> bytes: ...
 def infer_shapes_path(
     model_path: str,
@@ -37,6 +41,7 @@ def infer_shapes_path(
     check_type: bool,
     strict_mode: bool,
     data_prop: bool,
+    enable_symbolic_dimension_algebra: bool,
 ) -> None: ...
 def infer_function_output_types(
     b: bytes,

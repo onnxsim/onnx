@@ -748,17 +748,22 @@ NB_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) { // NOLINT(cppcoreguidelines-
 
   shape_inference.def(
       "infer_shapes",
-      [](const nb::bytes& bytes, bool check_type, bool strict_mode, bool data_prop) {
+      [](const nb::bytes& bytes,
+         bool check_type,
+         bool strict_mode,
+         bool data_prop,
+         bool enable_symbolic_dimension_algebra) {
         ModelProto proto{};
         ParseProtoFromPyBytesOrThrow(&proto, bytes);
-        ShapeInferenceOptions options{check_type, strict_mode ? 1 : 0, data_prop};
+        ShapeInferenceOptions options{check_type, strict_mode ? 1 : 0, data_prop, enable_symbolic_dimension_algebra};
         shape_inference::InferShapes(proto, OpSchemaRegistry::Instance(), options);
         return ProtoToBytes(proto);
       },
       nb::arg("bytes"),
       nb::arg("check_type") = false,
       nb::arg("strict_mode") = false,
-      nb::arg("data_prop") = false);
+      nb::arg("data_prop") = false,
+      nb::arg("enable_symbolic_dimension_algebra") = true);
 
   shape_inference.def(
       "infer_shapes_path",
@@ -766,10 +771,17 @@ NB_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) { // NOLINT(cppcoreguidelines-
          const std::string& output_path,
          bool check_type,
          bool strict_mode,
-         bool data_prop) -> void {
-        ShapeInferenceOptions options{check_type, strict_mode ? 1 : 0, data_prop};
+         bool data_prop,
+         bool enable_symbolic_dimension_algebra) -> void {
+        ShapeInferenceOptions options{check_type, strict_mode ? 1 : 0, data_prop, enable_symbolic_dimension_algebra};
         shape_inference::InferShapes(model_path, output_path, OpSchemaRegistry::Instance(), options);
-      });
+      },
+      nb::arg("model_path"),
+      nb::arg("output_path"),
+      nb::arg("check_type") = false,
+      nb::arg("strict_mode") = false,
+      nb::arg("data_prop") = false,
+      nb::arg("enable_symbolic_dimension_algebra") = true);
 
   shape_inference.def(
       "infer_function_output_types",

@@ -829,5 +829,40 @@ agraph (float[past_len, 4] past, float[seq_len, 4] cur) => (float[?, ?] z)
   EXPECT_EQ(z_shape.dim(1).dim_value(), 4);
 }
 
+TEST(SymbolicDimensionAlgebraTest, DisabledFlagFallsBackToUnrelatedAnonymousSymbols) {
+  // ShapeInferenceOptions.enable_symbolic_dimension_algebra=false is the
+  // off switch: with it, two Concat nodes computing the identical M + N
+  // expression must fall back to two unrelated anonymous symbols, exactly
+  // as before this proposal, instead of resolving to (and sharing) one
+  // real dim_param.
+  const char* modelStr = R"ONNX(
+<ir_version: 8, opset_import: ["" : 18]>
+agraph (float[M, 2] x, float[N, 2] y) => (float[?, 2] z1, float[?, 2] z2)
+{
+    z1 = Concat<axis=0>(x, y)
+    z2 = Concat<axis=0>(x, y)
+}
+)ONNX";
+
+  ModelProto model;
+  OnnxParser parser(modelStr);
+  auto status = parser.Parse(model);
+  ASSERT_TRUE(status.IsOK()) << status.ErrorMessage();
+  ASSERT_TRUE(parser.EndOfInput()) << "Extra unparsed input unexpected.";
+
+  ShapeInferenceOptions options{
+      /*check_type_val=*/true,
+      /*strict_mode_val=*/1,
+      /*data_prop_val=*/true,
+      /*enable_symbolic_dimension_algebra_val=*/false};
+  ONNX_NAMESPACE::shape_inference::InferShapes(model, ONNX_NAMESPACE::OpSchemaRegistry::Instance(), options);
+
+  const auto& z1_shape = model.graph().output(0).type().tensor_type().shape();
+  const auto& z2_shape = model.graph().output(1).type().tensor_type().shape();
+  ASSERT_TRUE(z1_shape.dim(0).has_dim_param());
+  ASSERT_TRUE(z2_shape.dim(0).has_dim_param());
+  EXPECT_NE(z1_shape.dim(0).dim_param(), z2_shape.dim(0).dim_param());
+}
+
 } // namespace Test
 } // namespace ONNX_NAMESPACE

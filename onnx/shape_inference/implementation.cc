@@ -511,8 +511,11 @@ class ShapeInferenceImplBase {
     // (operator+/-/* in shape_inference.h) for the duration of this node's
     // inference and data-propagation calls below, so that combining two
     // symbolic dims (e.g. `M + N`) can mint/reuse a real dim_param instead
-    // of leaving the result unknown.
-    ActiveSymbolTableGuard symbol_table_guard(symbol_table);
+    // of leaving the result unknown. Installing nullptr instead when the
+    // option is off makes that arithmetic fall back to its pre-existing,
+    // less-complete behavior -- the escape hatch for a consumer that needs
+    // to work around symbolic-dimension algebra rather than benefit from it.
+    ActiveSymbolTableGuard symbol_table_guard(options.enable_symbolic_dimension_algebra ? symbol_table : nullptr);
 
     ONNX_TRY {
       if (schema) {

@@ -35,8 +35,29 @@ struct ShapeInferenceOptions {
   // Enables data propagation for limited operators
   // to perform shape computation
   bool enable_data_propagation;
-  explicit ShapeInferenceOptions(bool check_type_val = false, int strict_mode_val = 0, bool data_prop_val = false)
-      : check_type(check_type_val), error_mode(strict_mode_val), enable_data_propagation(data_prop_val) {}
+  // Enables symbolic-dimension algebra (docs/proposals/
+  // 0008-SymbolicDimensionAlgebra.md): combining two dim_params via +/-/*
+  // resolves to a real, reusable dim_param standing for the resulting
+  // polynomial (e.g. `M + N`) instead of an anonymous unknown dimension.
+  // On by default, since it can only ever resolve *more* dimensions than
+  // before, never contradict a value shape inference would otherwise have
+  // produced. Exposed as a real off switch (not just a debugging knob) for
+  // the case where a specific consumer's own bug -- e.g. mishandling two
+  // distinct symbols it did not expect to see share a common prefix, or
+  // some other symbol-identity assumption this feature does not itself
+  // violate but a buggy caller might -- makes reverting to the old,
+  // stricter-but-less-complete behavior the practical workaround while
+  // that consumer is fixed.
+  bool enable_symbolic_dimension_algebra;
+  explicit ShapeInferenceOptions(
+      bool check_type_val = false,
+      int strict_mode_val = 0,
+      bool data_prop_val = false,
+      bool enable_symbolic_dimension_algebra_val = true)
+      : check_type(check_type_val),
+        error_mode(strict_mode_val),
+        enable_data_propagation(data_prop_val),
+        enable_symbolic_dimension_algebra(enable_symbolic_dimension_algebra_val) {}
 };
 
 // Maintains a SymbolTable for symbolic shape inference
