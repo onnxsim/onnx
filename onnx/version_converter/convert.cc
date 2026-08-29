@@ -55,6 +55,11 @@ ModelProto ConvertVersion(ModelProto& mp_in, int target_version) {
   return v.convert_version(mp_in, initial_struct, target_struct);
 }
 
+void ConvertVersionOnGraph(const std::shared_ptr<Graph>& g, int target_version) {
+  DefaultVersionConverter v;
+  v.convert_version_on_graph(g, target_version);
+}
+
 void DefaultVersionConverter::convert_graph(
     const std::shared_ptr<Graph>& g,
     const OpSetID& initial_version,
