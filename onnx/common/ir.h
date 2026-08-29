@@ -318,6 +318,20 @@ struct Value final {
   friend struct Graph;
   Node* node_;
   size_t offset_;
+  // Fallback numeric id backing uniqueName()'s no-real-name branch, minted
+  // eagerly in the constructor (see Value::Value() below) via
+  // Graph::getNextUnique(). Eager assignment is what keeps this
+  // deterministic: it is tied to Value *construction* order, which is fixed
+  // for a given input model, rather than to whichever code path first
+  // happens to read uniqueName() on an unnamed Value -- e.g. an
+  // unordered_map/set of Value* elsewhere whose iteration order depends on
+  // heap addresses, which differ from run to run. (An earlier version of
+  // this fix computed the id lazily, on first read, purely to dodge
+  // getNextUnique()'s cost; that made two otherwise-identical runs of the
+  // same input model produce different "_v_<n>" fallback names whenever
+  // such a container's iteration order changed run to run -- see
+  // Graph::used_names_ below for how getNextUnique() itself stays cheap
+  // without needing to give up eager, deterministic assignment.)
   size_t unique_ = 0; // unique id
   size_t stage_ = 0; // 0-forward, 1-backward, 2-double-backward,...
   use_list uses_in_current_graph_;
@@ -952,6 +966,38 @@ struct Graph final {
   std::unordered_map<const Value*, std::unique_ptr<const Value>> all_values;
   size_t next_unique_{0};
 
+  // Reference-counts every name currently displayed by this graph's own
+  // values (node inputs/outputs, graph inputs -- including their default,
+  // never-explicitly-set "_v_<n>" display names, registered at Value
+  // construction) and initializers, so isNameUnique() can answer with a
+  // single hash lookup instead of the O(graph size) scan it used to run on
+  // every call (a std::find over initializer_names_, plus, per node, two
+  // more std::find_if scans over its inputs/outputs) -- the cost that made
+  // Graph::getNextUnique() O(V) per call and graph Import O(V^2) overall.
+  // A count (not a plain set) because one name can have more than one live
+  // holder at once -- e.g. an initializer's own initializer_names_ entry
+  // and the Graph Value that mirrors it (addInitializerAndCreateValue), or
+  // an output value mid-rename in Value::replaceAllUsesWith -- and the name
+  // must stay reserved until every holder releases it via useName()/
+  // releaseName(), not just the first one to let go. This is NOT extended to
+  // names used inside subgraph attributes (If/Loop/Scan bodies): each nested
+  // subgraph is its own Graph with its own used_names_, and isNameUnique()
+  // recurses into those explicitly below.
+  std::unordered_map<std::string, size_t> used_names_;
+
+  void useName(const std::string& name) {
+    ++used_names_[name];
+  }
+  void releaseName(const std::string& name) {
+    auto it = used_names_.find(name);
+    if (it == used_names_.end()) {
+      return;
+    }
+    if (--it->second == 0) {
+      used_names_.erase(it);
+    }
+  }
+
   // Memoizes hasAnySubgraphNode() below (whether this graph's own all_nodes,
   // not recursing into subgraphs, contains a node with a g/gs attribute).
   // `subgraph_node_cache_valid_` false means "unknown, recompute";
@@ -990,16 +1036,28 @@ struct Graph final {
   std::vector<OpSetID> opset_versions_;
 
   bool isNameUnique(const std::string& name) const {
-    if (std::find(initializer_names_.cbegin(), initializer_names_.cend(), name) != initializer_names_.cend()) {
+    // O(1) check against this graph's own initializer/value names, replacing
+    // what used to be a linear scan of initializer_names_ plus, per node,
+    // two more linear string-comparison scans over its inputs and outputs.
+    if (used_names_.count(name)) {
       return false;
     }
-    const auto f = [&name](const Value* v) { return v->uniqueName() == name; };
+    // hasAnySubgraphNode() is the same memoized "does this graph contain any
+    // If/Loop/Scan-style node at all" check forSelfAndEachSubGraphImpl()
+    // already uses -- O(1) for the overwhelming common case (no
+    // control-flow ops), so this recursion is skipped entirely instead of
+    // walking every node just to conclude there is nothing to recurse into.
+    if (!hasAnySubgraphNode()) {
+      return true;
+    }
     for (const auto& node_entry : all_nodes) {
       const Node* node = node_entry.first;
+      if (!node->hasSubgraphAttribute()) {
+        continue;
+      }
       for (const auto& attr : node->attributeNames()) {
         if (node->kindOf(attr) == AttributeKind::g) {
-          const auto& subgraph = node->g(attr);
-          if (!subgraph->isNameUnique(name)) {
+          if (!node->g(attr)->isNameUnique(name)) {
             return false;
           }
         } else if (node->kindOf(attr) == AttributeKind::gs) {
@@ -1009,14 +1067,6 @@ struct Graph final {
             }
           }
         }
-      }
-      const auto* const found_in = std::find_if(node->inputs().begin(), node->inputs().end(), f);
-      if (found_in != node->inputs().end()) {
-        return false;
-      }
-      const auto* const found_out = std::find_if(node->outputs().begin(), node->outputs().end(), f);
-      if (found_out != node->outputs().end()) {
-        return false;
       }
     }
     return true;
@@ -1094,6 +1144,7 @@ struct Graph final {
     // std::vector<Tensor> would silently invalidate.
     initializers_.push_back(std::make_unique<Tensor>(initializer));
     initializer_names_.push_back(initializer.name());
+    useName(initializer.name());
   }
 
   // Move-taking overload. The lvalue overload above always copies
@@ -1111,6 +1162,7 @@ struct Graph final {
     // Read the name before the move below invalidates initializer's own
     // fields (Tensor's move constructor moves name_ too).
     initializer_names_.push_back(initializer.name());
+    useName(initializer_names_.back());
     initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
   }
 
@@ -1140,6 +1192,7 @@ struct Graph final {
     init_value->setSizes(dim_sizes);
     init_value->setElemType(initializer.elem_type());
     initializer_names_.push_back(initializer.name());
+    useName(initializer_names_.back());
     initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
     return init_value;
   }
@@ -1153,6 +1206,7 @@ struct Graph final {
         initializers_.end());
     initializer_names_.erase(
         std::remove(initializer_names_.begin(), initializer_names_.end(), name), initializer_names_.end());
+    releaseName(name);
     for (size_t i = 0; i < initializer_node_->outputs().size(); i++) {
       if (initializer_node_->outputs()[i]->uniqueName() == name) {
         initializer_node_->eraseOutput(i);
@@ -1161,6 +1215,9 @@ struct Graph final {
     }
   }
   void clearInitializers() {
+    for (const auto& name : initializer_names_) {
+      releaseName(name);
+    }
     initializers_.clear();
     initializer_names_.clear();
   }
@@ -1222,11 +1279,19 @@ struct Graph final {
   }
 
   size_t getNextUnique() {
-    std::string next_unique_name = toVarName(++next_unique_);
+    // isNameUnique() below is now a used_names_ hash lookup (plus, rarely, a
+    // recursion into subgraph attributes) -- it no longer calls uniqueName()
+    // on other Values, so this can't recurse back into getNextUnique() on
+    // this same Graph. Still returns the locally-captured candidate rather
+    // than re-reading next_unique_, simply because that's the id this call
+    // actually verified unique.
+    size_t candidate = ++next_unique_;
+    std::string next_unique_name = toVarName(candidate);
     while (!isNameUnique(next_unique_name)) {
-      next_unique_name = toVarName(++next_unique_);
+      candidate = ++next_unique_;
+      next_unique_name = toVarName(candidate);
     }
-    return next_unique_;
+    return candidate;
   }
 
   std::string getNextUniqueName() {
@@ -1540,6 +1605,10 @@ struct Graph final {
     all_nodes.erase(it);
   }
   void freeValue(Value* v) {
+    // v->unique_name_ directly, not v->uniqueName(): avoids a string copy in
+    // the common (explicitly-named) case; the default-name branch still has
+    // to materialize "_v_<n>" since there's no stored copy of it to borrow.
+    releaseName(v->has_unique_name() ? v->unique_name_ : toVarName(v->unique_));
     auto it = all_values.find(v);
     ONNX_ASSERT(it != all_values.end())
     all_values.erase(it);
@@ -1547,7 +1616,16 @@ struct Graph final {
 };
 
 inline Value::Value(Node& node, size_t offset)
-    : node_(&node), offset_(offset), unique_(node.graph_->getNextUnique()), stage_(node.graph_->new_node_stage_) {}
+    : node_(&node), offset_(offset), unique_(node.graph_->getNextUnique()), stage_(node.graph_->new_node_stage_) {
+  // Every value occupies its default display name ("_v_<unique_>") in
+  // used_names_ from construction, even before any explicit rename --
+  // setUniqueName() and Graph::freeValue() release it. Without this, a
+  // nested subgraph's own unnamed values would be invisible to
+  // isNameUnique() calls recursing in from an enclosing graph, since each
+  // Graph -- parent and subgraph alike -- keeps an independently-numbered
+  // unique_ counter and so can mint the very same "_v_<n>" default name.
+  node.graph_->useName(toVarName(unique_));
+}
 
 inline Graph* Value::owningGraph() {
   return node()->owningGraph();
@@ -1563,14 +1641,26 @@ inline const Graph* Value::owningGraph() const {
 // Initializer names are also stored in graph.initializer_names_, it should be
 // updated too.
 inline Value* Value::setUniqueName(const std::string& name, bool update_related_names) {
+  if (has_unique_name_ && unique_name_ == name) {
+    // Already exactly this name; nothing to update. (replaceAllUsesWith's
+    // captured-node fixup loop routinely re-applies a value's existing
+    // name.)
+    return this;
+  }
+  auto* graph = owningGraph();
   if (has_unique_name() && update_related_names) {
-    auto* graph = owningGraph();
     auto old_name = unique_name_;
     for (size_t i = 0; i < owningGraph()->initializer_names_.size(); i++) {
       auto& initializer_name = owningGraph()->initializer_names_[i];
       if (initializer_name == old_name) {
         initializer_name = name;
         owningGraph()->initializers_[i]->setName(name);
+        // This initializer_names_ entry is its own holder of the name,
+        // independent of this Value's own registration below -- see
+        // used_names_'s comment for why the same name can have more than
+        // one live holder at once.
+        graph->releaseName(old_name);
+        graph->useName(name);
       }
     }
     // forEachNodeInSubgraphs(), not forEachNode(): this only ever cares
@@ -1587,8 +1677,15 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
       }
     });
   }
+  // Release whatever name this value currently displays -- explicit or
+  // still just its default -- before claiming the new one, so a second
+  // holder of the same name (e.g. an initializer's Tensor entry, or
+  // newValue in Value::replaceAllUsesWith while this value is mid-rename
+  // off of it) keeps its own claim alive in used_names_.
+  graph->releaseName(has_unique_name_ ? unique_name_ : toVarName(unique_));
   unique_name_ = name;
   has_unique_name_ = true;
+  graph->useName(name);
   return this;
 }
 

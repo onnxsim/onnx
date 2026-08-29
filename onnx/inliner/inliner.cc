@@ -416,7 +416,81 @@ const TypeProto& GetType(const ModelProto& model, const std::string& var) {
   ONNX_ASSERTM(false, "Type unknown for ", var)
 }
 
-void ConvertVersion(ModelProto& model, const NodeProto& call_node, FunctionProto& function, int target_version) {
+// version_conversion::ConvertVersion (below) imports `function_as_model`'s
+// graph into its own, throwaway onnx::Graph (see ir_pb_converter.cc's
+// ImportModelProto) purely to run the opset adapters -- and that Graph's
+// fallback-name counter (Graph::next_unique_) starts at 0 independently of
+// every other such throwaway Graph and of `model` itself. An adapter that
+// introduces a brand-new node with no name of its own (e.g.
+// AxesAttributeToInput's Constant, promoting an attribute to an input) gets
+// a name like "_v_1" purely from that local counter. Two separate calls to
+// this function -- one per inlined call-site -- each get their own such
+// throwaway Graph, so both can independently produce "_v_1" for their own
+// new Constant; nothing reconciles the two before both are spliced back into
+// the same `model`, so they collide (SSA violation) once merged.
+//
+// Fix: after conversion, walk the converted graph and rename anything that
+// is not one of the names we know we handed it going in (the call-site's own
+// inputs/outputs and the original function body's own node inputs/outputs --
+// all already unique within `model`, courtesy of InliningRenamer having run
+// on `function` first) to a fresh name drawn from `name_generator` --
+// `InlinerImpl`'s single, continuously-updated registry of every name used
+// anywhere in `model` so far (across every call-site processed, not just
+// this one). That's the same source of truth InliningRenamer itself already
+// draws from for the original (pre-conversion) names, so this closes exactly
+// the gap version conversion's private, from-scratch Graph opens up.
+void RenameNewNames(GraphProto& graph, const std::unordered_set<std::string>& known_names, NameGenerator& name_generator) {
+  std::unordered_map<std::string, std::string> renamed;
+  auto rename_if_new = [&](std::string& name) {
+    if (name.empty() || known_names.count(name) != 0) {
+      return;
+    }
+    auto it = renamed.find(name);
+    if (it == renamed.end()) {
+      it = renamed.emplace(name, name_generator.CreateNew(name)).first;
+    }
+    name = it->second;
+  };
+  // Initializers first, so a later node-input reference to one (matched via
+  // `renamed`, keyed by the original name) picks up the same new name.
+  for (auto& init : *graph.mutable_initializer()) {
+    std::string name = init.name();
+    rename_if_new(name);
+    init.set_name(name);
+  }
+  for (auto& init : *graph.mutable_sparse_initializer()) {
+    if (init.has_values()) {
+      std::string name = init.values().name();
+      rename_if_new(name);
+      init.mutable_values()->set_name(name);
+    }
+  }
+  // Graph inputs/outputs are deliberately not touched here -- they are
+  // exactly the call-site's own bound names, already present in
+  // `known_names` (see ConvertVersion below), so `rename_if_new` leaves them
+  // alone regardless.
+  //
+  // Not recursed into subgraph (g/graphs) attributes: none of the current
+  // version-conversion adapters (onnx/version_converter/adapters/*) create
+  // subgraph-bearing nodes, only plain nodes like the Constant above: if one
+  // ever does, this would need to recurse the same way ProcessGraph's
+  // subgraph handling elsewhere in this file does.
+  for (auto& node : *graph.mutable_node()) {
+    for (auto& in : *node.mutable_input()) {
+      rename_if_new(in);
+    }
+    for (auto& out : *node.mutable_output()) {
+      rename_if_new(out);
+    }
+  }
+}
+
+void ConvertVersion(
+    ModelProto& model,
+    const NodeProto& call_node,
+    FunctionProto& function,
+    int target_version,
+    NameGenerator& name_generator) {
   shape_inference::InferShapes(model);
 
   ModelProto function_as_model;
@@ -459,7 +533,25 @@ void ConvertVersion(ModelProto& model, const NodeProto& call_node, FunctionProto
     *nodes.Add() = std::move(function_node);
   function_nodes.Clear();
 
+  // Every name already present in `graph` at this point (call-site inputs,
+  // call-site outputs, and the original function body's own node
+  // inputs/outputs) is already unique within `model` -- see RenameNewNames's
+  // comment above for why anything version conversion introduces beyond
+  // this set needs renaming before it can safely be merged back.
+  std::unordered_set<std::string> known_names;
+  for (const auto& x : graph.input())
+    known_names.insert(x.name());
+  for (const auto& x : graph.output())
+    known_names.insert(x.name());
+  for (const auto& n : nodes) {
+    for (const auto& in : n.input())
+      known_names.insert(in);
+    for (const auto& out : n.output())
+      known_names.insert(out);
+  }
+
   auto converted = ONNX_NAMESPACE::version_conversion::ConvertVersion(function_as_model, target_version);
+  RenameNewNames(*converted.mutable_graph(), known_names, name_generator);
 
   function_nodes.Swap(converted.mutable_graph()->mutable_node());
 
@@ -589,7 +681,7 @@ struct InlinerImpl {
         // Rename variable names in callee
         InliningRenamer::Rename(node, callee, "__" + std::to_string(++(this->inline_count)), this->name_generator);
         if (target_version != kNoConversion) {
-          ConvertVersion(model, node, callee, static_cast<int>(target_version));
+          ConvertVersion(model, node, callee, static_cast<int>(target_version), this->name_generator);
         }
         std::unordered_set<std::string> actual_parameters;
         for (const auto& x : node.input())
