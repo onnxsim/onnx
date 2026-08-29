@@ -992,7 +992,56 @@ class DefaultVersionConverter : public BaseVersionConverter {
 
   ModelProto convert_version(const ModelProto& mp_in, const OpSetID& initial_version, const OpSetID& target_version)
       const override;
+
+  // Consuming overload: moves each initializer's raw bytes out of ``mp_in``
+  // (via the moving ``ImportModelProto(ModelProto&)``) instead of copying
+  // them, and has ``ExportModelProto`` move them back out of the internal
+  // Graph IR (``consume_tensor_data=true``) rather than copying into the
+  // returned ModelProto. Only call this when ``mp_in`` is about to be
+  // discarded or overwritten by the caller -- it is not safe to read
+  // ``mp_in``'s initializer data after this call. Roughly halves the memory
+  // traffic of a ModelProto <-> Graph round trip for models with large
+  // initializers; see ir_pb_converter.h's moving overloads for the same
+  // optimization already used by onnx-optimizer's ``Optimizer::optimize()``.
+  ModelProto convert_version(ModelProto& mp_in, const OpSetID& initial_version, const OpSetID& target_version) const;
+
+  // Convert the default-domain ("" / "ai.onnx") opset of an already
+  // Graph-IR-resident model in place, with no ModelProto<->Graph round trip
+  // at either end. For a caller that already holds `g` -- e.g. an outer
+  // fixed-point pipeline that imports once and exports once around several
+  // Graph-native transforms, the way onnx-optimizer's Optimizer::optimize()
+  // and onnxsim's own resident-Graph pipeline do -- this avoids paying a
+  // second Import/Export pair just for opset conversion, unlike
+  // convert_version(ModelProto&, ...)/ConvertVersion(ModelProto&, int)
+  // below, which always do their own. A no-op if `g` does not import the
+  // default domain, or is already at target_version. `convert_graph` (called
+  // here) asserts `g` is non-null.
+  void convert_version_on_graph(const std::shared_ptr<Graph>& g, int target_version) const {
+    int64_t initial_version = 0;
+    bool found = false;
+    for (const auto& opset : g->opset_versions_mutable()) {
+      if (opset.domain().empty() || opset.domain() == "ai.onnx") {
+        initial_version = opset.version();
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return;
+    }
+    convert_graph(g, OpSetID(initial_version), OpSetID(target_version));
+  }
 };
 
 ONNX_API ModelProto ConvertVersion(const ModelProto& mp_in, int target_version);
+
+// Consuming overload of ConvertVersion; see DefaultVersionConverter's
+// consuming convert_version overload above for the contract.
+ONNX_API ModelProto ConvertVersion(ModelProto& mp_in, int target_version);
+
+// Free-function counterpart of DefaultVersionConverter::convert_version_on_graph,
+// matching the ConvertVersion free functions above (constructs a
+// DefaultVersionConverter and delegates). See convert_version_on_graph's own
+// comment for the contract and when to prefer this over ConvertVersion.
+ONNX_API void ConvertVersionOnGraph(const std::shared_ptr<Graph>& g, int target_version);
 } // namespace ONNX_NAMESPACE::version_conversion
