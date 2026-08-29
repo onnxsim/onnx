@@ -1105,7 +1105,23 @@ class DefaultVersionConverter : public BaseVersionConverter {
 
   ModelProto convert_version(const ModelProto& mp_in, const OpSetID& initial_version, const OpSetID& target_version)
       const override;
+
+  // Consuming overload: moves each initializer's raw bytes out of ``mp_in``
+  // (via the moving ``ImportModelProto(ModelProto&)``) instead of copying
+  // them, and has ``ExportModelProto`` move them back out of the internal
+  // Graph IR (``consume_tensor_data=true``) rather than copying into the
+  // returned ModelProto. Only call this when ``mp_in`` is about to be
+  // discarded or overwritten by the caller -- it is not safe to read
+  // ``mp_in``'s initializer data after this call. Roughly halves the memory
+  // traffic of a ModelProto <-> Graph round trip for models with large
+  // initializers; see ir_pb_converter.h's moving overloads for the same
+  // optimization already used by onnx-optimizer's ``Optimizer::optimize()``.
+  ModelProto convert_version(ModelProto& mp_in, const OpSetID& initial_version, const OpSetID& target_version) const;
 };
 
 ONNX_API ModelProto ConvertVersion(const ModelProto& mp_in, int target_version);
+
+// Consuming overload of ConvertVersion; see DefaultVersionConverter's
+// consuming convert_version overload above for the contract.
+ONNX_API ModelProto ConvertVersion(ModelProto& mp_in, int target_version);
 } // namespace ONNX_NAMESPACE::version_conversion
