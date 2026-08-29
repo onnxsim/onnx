@@ -317,6 +317,20 @@ struct Value final {
   friend struct Graph;
   Node* node_;
   size_t offset_;
+  // Fallback numeric id backing uniqueName()'s no-real-name branch, minted
+  // eagerly in the constructor (see Value::Value() below) via
+  // Graph::getNextUnique(). Eager assignment is what keeps this
+  // deterministic: it is tied to Value *construction* order, which is fixed
+  // for a given input model, rather than to whichever code path first
+  // happens to read uniqueName() on an unnamed Value -- e.g. an
+  // unordered_map/set of Value* elsewhere whose iteration order depends on
+  // heap addresses, which differ from run to run. (An earlier version of
+  // this fix computed the id lazily, on first read, purely to dodge
+  // getNextUnique()'s cost; that made two otherwise-identical runs of the
+  // same input model produce different "_v_<n>" fallback names whenever
+  // such a container's iteration order changed run to run -- see
+  // Graph::used_names_ below for how getNextUnique() itself stays cheap
+  // without needing to give up eager, deterministic assignment.)
   size_t unique_ = 0; // unique id
   size_t stage_ = 0; // 0-forward, 1-backward, 2-double-backward,...
   use_list uses_in_current_graph_;
@@ -1140,6 +1154,7 @@ struct Graph final {
     // Read the name before the move below invalidates initializer's own
     // fields (Tensor's move constructor moves name_ too).
     initializer_names_.push_back(initializer.name());
+    useName(initializer_names_.back());
     initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
   }
 
@@ -1169,6 +1184,7 @@ struct Graph final {
     init_value->setSizes(dim_sizes);
     init_value->setElemType(initializer.elem_type());
     initializer_names_.push_back(initializer.name());
+    useName(initializer_names_.back());
     initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
     return init_value;
   }
@@ -1259,11 +1275,19 @@ struct Graph final {
   }
 
   size_t getNextUnique() {
-    std::string next_unique_name = toVarName(++next_unique_);
+    // isNameUnique() below is now a used_names_ hash lookup (plus, rarely, a
+    // recursion into subgraph attributes) -- it no longer calls uniqueName()
+    // on other Values, so this can't recurse back into getNextUnique() on
+    // this same Graph. Still returns the locally-captured candidate rather
+    // than re-reading next_unique_, simply because that's the id this call
+    // actually verified unique.
+    size_t candidate = ++next_unique_;
+    std::string next_unique_name = toVarName(candidate);
     while (!isNameUnique(next_unique_name)) {
-      next_unique_name = toVarName(++next_unique_);
+      candidate = ++next_unique_;
+      next_unique_name = toVarName(candidate);
     }
-    return next_unique_;
+    return candidate;
   }
 
   std::string getNextUniqueName() {
@@ -1596,14 +1620,20 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
     // captured-node fixup loop routinely re-applies a value's existing name.)
     return this;
   }
+  auto* graph = owningGraph();
   if (has_unique_name() && update_related_names) {
-    auto* graph = owningGraph();
     auto old_name = unique_name_;
     for (size_t i = 0; i < owningGraph()->initializer_names_.size(); i++) {
       auto& initializer_name = owningGraph()->initializer_names_[i];
       if (initializer_name == old_name) {
         initializer_name = name;
         owningGraph()->initializers_[i]->setName(name);
+        // This initializer_names_ entry is its own holder of the name,
+        // independent of this Value's own registration below -- see
+        // used_names_'s comment for why the same name can have more than
+        // one live holder at once.
+        graph->releaseName(old_name);
+        graph->useName(name);
       }
     }
     // forEachNodeInSubgraphs(), not forEachNode(): this only ever cares
@@ -1620,16 +1650,15 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
       }
     });
   }
-  Graph* g = owningGraph();
   // Release whatever name this value currently displays -- explicit or still
   // just its default -- before claiming the new one, so a second holder of
   // the same name (e.g. an initializer's Tensor entry, or newValue in
   // Value::replaceAllUsesWith while this value is mid-rename off of it) keeps
   // its own claim alive in used_names_.
-  g->releaseName(has_unique_name_ ? unique_name_ : toVarName(unique_));
+  graph->releaseName(has_unique_name_ ? unique_name_ : toVarName(unique_));
   unique_name_ = name;
   has_unique_name_ = true;
-  g->useName(name);
+  graph->useName(name);
   return this;
 }
 
