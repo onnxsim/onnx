@@ -27,7 +27,32 @@ ModelProto ConvertVersion(const ModelProto& mp_in, int target_version) {
   }
   OpSetID target_struct = OpSetID(target_version);
   DefaultVersionConverter v;
-  return v.convert_version(inferred_model, initial_struct, target_struct);
+  return v.convert_version(static_cast<const ModelProto&>(inferred_model), initial_struct, target_struct);
+}
+
+ModelProto ConvertVersion(ModelProto& mp_in, int target_version) {
+  // In-place, not into a copy like the const overload above: mp_in is
+  // already mutable and about to be consumed by this call, so there is no
+  // separate "inferred_model" to make -- shape_inference::InferShapes fills
+  // in mp_in's value_info directly. This still has to happen before
+  // ImportModelProto below: adapters such as TypeRestriction (see
+  // onnx/version_converter/adapters/type_restriction.h) key off each Value's
+  // elemType(), which without this would stay UNDEFINED for any value with
+  // no explicit value_info in the input model -- silently skipping type
+  // checks the const overload correctly enforces.
+  shape_inference::InferShapes(mp_in);
+
+  // Get initial_opsetid from mp_in
+  OpSetID initial_struct(0);
+  for (const auto& it : mp_in.opset_import()) {
+    if (it.domain().empty() || it.domain() == "ai.onnx") {
+      initial_struct.setVersion(it.version());
+      break;
+    }
+  }
+  OpSetID target_struct = OpSetID(target_version);
+  DefaultVersionConverter v;
+  return v.convert_version(mp_in, initial_struct, target_struct);
 }
 
 void DefaultVersionConverter::convert_graph(
@@ -157,6 +182,38 @@ ModelProto DefaultVersionConverter::convert_version(
   debug("Finished conversion; returning model");
   ModelProto mp_out = PrepareOutput(mp_in);
   ExportModelProto(&mp_out, g);
+  return mp_out;
+}
+
+ModelProto DefaultVersionConverter::convert_version(
+    ModelProto& mp_in,
+    const OpSetID& initial_version,
+    const OpSetID& target_version) const {
+  const std::string& initial_domain = initial_version.domain();
+  const std::string& target_domain = target_version.domain();
+  assertDefaultDomain(initial_domain, target_domain);
+
+  for (auto it = mp_in.opset_import().begin(); it != mp_in.opset_import().end(); ++it) {
+    if (it->domain() == initial_version.domain()) {
+      ONNX_ASSERTM(
+          initial_version.version() == it->version(), "initial_version does not reflect current state of model")
+    }
+  }
+
+  // ImportModelProto's mutable overload moves each initializer's raw bytes
+  // out of mp_in instead of copying them (see ir_pb_converter.h); mp_in's
+  // initializer tensors are left with empty raw data after this call.
+  std::shared_ptr<Graph> g(ImportModelProto(mp_in));
+
+  convert_graph(g, initial_version, target_version);
+
+  // Export g as ModelProto. mp_in's non-tensor metadata (opset imports, etc.)
+  // is untouched by the move above, so PrepareOutput still reads it correctly
+  // here. consume_tensor_data=true moves the converted initializer bytes out
+  // of g rather than copying them, matching the moving Import above.
+  debug("Finished conversion; returning model");
+  ModelProto mp_out = PrepareOutput(mp_in);
+  ExportModelProto(&mp_out, g, /*consume_tensor_data=*/true);
   return mp_out;
 }
 
