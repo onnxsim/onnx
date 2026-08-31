@@ -245,8 +245,9 @@ class GraphShapeInferenceRunner {
  public:
   explicit GraphShapeInferenceRunner(
       const ShapeInferenceOptions& options,
-      shape_inference::DataValueMap* generated_shape_data)
-      : options_(options), generated_shape_data_(generated_shape_data) {
+      shape_inference::DataValueMap* generated_shape_data,
+      const shape_inference::ModelLocalFunctionsMap& model_local_functions)
+      : options_(options), generated_shape_data_(generated_shape_data), model_local_functions_(model_local_functions) {
     if (options_.enable_data_propagation && generated_shape_data_ == nullptr) {
       fail_shape_inference(
           "Container for generated shape data cannot be nullptr when enable_data_propagation option is set.");
@@ -377,11 +378,40 @@ class GraphShapeInferenceRunner {
     }
     const std::string op_type = node.kind().toString();
     const OpSchema* schema = registry->GetSchema(op_type, dit->second, domain);
-    if (schema == nullptr || !schema->has_type_and_shape_inference_function()) {
-      // Unsupported op (no schema, or a function-body-only op -- see this
-      // file's v1-scope doc comment): leave outputs as-is, same as onnx's
-      // own protobuf-based InferShapes does for a genuinely unknown op.
-      return false;
+    // Non-null only when this node calls a function instead of having its
+    // own ordinary inference formula -- either schema-attached
+    // (OpSchema::HasFunction(), e.g. LogSoftmax) or model-local
+    // (ModelProto.functions(), looked up by domain:op_type[:overload] in
+    // model_local_functions_ -- see this file's header doc comment for why
+    // a Graph needs that map passed in explicitly, since it carries no
+    // notion of model-local functions itself). Mirrors
+    // ShapeInferenceImplBase::Process(NodeProto&)'s own schema/model-local
+    // dispatch (implementation.cc) exactly, so behavior matches the
+    // protobuf-based path.
+    const FunctionProto* function_proto = nullptr;
+    if (schema != nullptr) {
+      if (!schema->has_type_and_shape_inference_function()) {
+        if (schema->HasFunction()) {
+          function_proto = schema->GetFunction();
+        }
+        if (function_proto == nullptr) {
+          // Unsupported op (no ordinary inference fn, no function body):
+          // leave outputs as-is, same as onnx's own protobuf-based
+          // InferShapes does for a genuinely unknown op.
+          return false;
+        }
+      }
+    } else if (!model_local_functions_.empty()) {
+      const std::string overload = node.has_overload() ? node.overload() : std::string();
+      const std::string function_id =
+          overload.empty() ? domain + ":" + op_type : domain + ":" + op_type + ":" + overload;
+      auto it = model_local_functions_.find(function_id);
+      if (it == model_local_functions_.end()) {
+        return false; // No schema and no matching model-local function: unsupported op.
+      }
+      function_proto = it->second;
+    } else {
+      return false; // No schema at all, and no model-local functions to check against.
     }
 
     // Every protobuf message this one node visit builds -- np below plus its
@@ -415,6 +445,9 @@ class GraphShapeInferenceRunner {
     }
     if (node.has_name()) {
       np.set_name(node.name());
+    }
+    if (node.has_overload()) {
+      np.set_overload(node.overload());
     }
     const auto& inputs = node.inputs();
     const auto& outputs = node.outputs();
@@ -497,7 +530,23 @@ class GraphShapeInferenceRunner {
     // had no registered schema.
     bool changed = false;
     ONNX_TRY {
-      schema->GetTypeAndShapeInferenceFunction()(ctx);
+      if (function_proto != nullptr) {
+        // schema is null for a model-local function call (no OpSchema
+        // resolved at all) and non-null-but-function-body-only for a
+        // schema-attached one -- either way, dispatch through onnx's own,
+        // unmodified InferShapeForFunctionNode() rather than a
+        // schema-registered TypeAndShapeInferenceFunction: it binds `ctx`'s
+        // actual input types/attributes into a fresh per-invocation scope,
+        // recurses into the function body's own nodes (themselves handled
+        // by that same existing machinery, including any further nested
+        // function calls or If/Loop/Scan subgraphs), and copies each
+        // function output's inferred type back onto ctx.getOutputType(i) --
+        // see this file's header doc comment.
+        shape_inference::InferShapeForFunctionNode(
+            *function_proto, registry, ctx, options_, model_local_functions_, &symbol_table_, generated_shape_data_);
+      } else {
+        schema->GetTypeAndShapeInferenceFunction()(ctx);
+      }
       for (size_t i = 0; i < outputs.size(); ++i) {
         TypeProto* inferred = ctx.getOutputType(i);
         if (inferred == nullptr) {
@@ -528,7 +577,14 @@ class GraphShapeInferenceRunner {
       // (via DataPropagationContextImpl) can then read back -- e.g. chaining
       // Shape -> Gather -> Concat end to end even though nothing here is a
       // graph initializer.
-      if (options_.enable_data_propagation && schema->has_data_propagation_function()) {
+      // schema is null for a model-local function call (see above) -- a
+      // function-body call's own data propagation happens inside
+      // InferShapeForFunctionNode() itself (via each of the function body's
+      // own nodes' data-propagation functions, fed through
+      // generated_shape_data_ exactly as above), not through a
+      // schema-level data-propagation function of its own (a
+      // function-body-only OpSchema doesn't register one).
+      if (schema != nullptr && options_.enable_data_propagation && schema->has_data_propagation_function()) {
         shape_inference::DataPropagationContextImpl data_propagation_ctx(
             np, value_types_by_name, input_data_by_name, *generated_shape_data_);
         schema->GetDataPropagationFunction()(data_propagation_ctx);
@@ -542,6 +598,7 @@ class GraphShapeInferenceRunner {
 
   const ShapeInferenceOptions& options_;
   shape_inference::DataValueMap* generated_shape_data_;
+  const shape_inference::ModelLocalFunctionsMap& model_local_functions_;
   // Reset (default-constructed) for every Run() call and re-seeded from the
   // graph's current state each time -- see the seeding loop in Run().
   GraphIrSymbolTable symbol_table_;
@@ -552,8 +609,9 @@ class GraphShapeInferenceRunner {
 bool InferShapesOnGraph(
     Graph& g,
     const ShapeInferenceOptions& options,
-    shape_inference::DataValueMap* out_generated_shape_data) {
-  GraphShapeInferenceRunner runner(options, out_generated_shape_data);
+    shape_inference::DataValueMap* out_generated_shape_data,
+    const shape_inference::ModelLocalFunctionsMap& model_local_functions) {
+  GraphShapeInferenceRunner runner(options, out_generated_shape_data, model_local_functions);
   return runner.Run(g);
 }
 
