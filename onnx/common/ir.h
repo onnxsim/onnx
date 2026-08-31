@@ -1490,8 +1490,8 @@ struct Graph final {
   // forEachNode() must still visit every one of self's own nodes to honor
   // its own (more general) "visit self too" contract, even when the caller's
   // own callback immediately discards every one of them -- an O(graph size)
-  // cost paid for nothing when self has no subgraphs. This skips straight to
-  // hasAnySubgraphNode()'s O(1) answer in that case instead.
+  // cost paid for nothing when self has no subgraphs. This iterates
+  // subgraph_bearing_nodes_ instead, which is empty in that case.
   void forEachNodeInSubgraphs(const std::function<void(Node*)>& fn) {
     forEachNodeInSubgraphsImpl(this, fn);
   }
@@ -1544,18 +1544,14 @@ struct Graph final {
   // separate traversal instead of forEachNode() plus a filter.
   template <typename GraphPtr, typename Fn>
   static void forEachNodeInSubgraphsImpl(GraphPtr self, const Fn& fn) {
-    if (!self->hasAnySubgraphNode()) {
-      return;
-    }
-    for (const auto& node_entry : self->all_nodes) {
-      const Node* node = node_entry.first;
-      if (!node->hasSubgraphAttribute()) {
-        continue;
-      }
-      for (const auto& attr : node->attributeNames()) {
-        if (node->kindOf(attr) == AttributeKind::g) {
+    // Iterates subgraph_bearing_nodes_, not all_nodes -- see
+    // forSelfAndEachSubGraphImpl's comment for why.
+    for (const Node* node : self->subgraph_bearing_nodes_) {
+      for (const auto& attr_kind : subgraphAttrsOf(node)) {
+        Symbol attr = attr_kind.first;
+        if (attr_kind.second == AttributeKind::g) {
           forEachNodeImpl(node->g(attr).get(), fn);
-        } else if (node->kindOf(attr) == AttributeKind::gs) {
+        } else {
           for (const auto& subgraph : node->gs(attr)) {
             forEachNodeImpl(subgraph.get(), fn);
           }
