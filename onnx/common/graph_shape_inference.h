@@ -43,12 +43,26 @@ namespace ONNX_NAMESPACE {
 // initializers and already-processed node outputs, mirroring onnx's own
 // outer_scope_value_types_by_name mechanism.
 //
+// Function-body inference (for ops defined as an onnx function rather than
+// a native op, whether schema-attached via OpSchema::HasFunction() or
+// model-local via ModelProto.functions()) IS implemented: dispatches to
+// onnx's own, unmodified shape_inference::InferShapeForFunctionNode() with
+// the same per-node InferenceContext this file already builds for ordinary
+// ops -- the function body's own nodes (including any of its own nested
+// function calls or If/Loop/Scan subgraphs) are inferred entirely by that
+// existing machinery, not reimplemented here. `model_local_functions` is
+// this Graph's owning ModelProto.functions(), if any -- a Graph carries no
+// notion of model-local functions itself (see ir.h's own "Graph represents
+// one function of computation" framing), so a caller whose node references
+// one must pass it in explicitly; omit it (the default, empty) if the
+// model has none, or if the caller doesn't have it on hand -- exactly as if
+// that particular function were undefined (see the v1-scope note below,
+// same safe fallback).
+//
 // v1 scope -- these remaining limitations are all *safe*: an affected
 // node's outputs are simply left as they were, exactly as if the op had no
 // registered schema (onnx's own protobuf-based InferShapes does the same
 // for a genuinely unknown op), never producing incorrect information:
-//  - Function-body inference (schema->HasFunction(), for ops defined as an
-//    onnx function rather than a native op) is not implemented.
 //  - Sparse tensor inputs are not fed to getInputSparseData().
 //
 // Returns whether any value's inferred type/shape actually changed
@@ -66,6 +80,7 @@ namespace ONNX_NAMESPACE {
 bool InferShapesOnGraph(
     Graph& g,
     const ShapeInferenceOptions& options = ShapeInferenceOptions(),
-    shape_inference::DataValueMap* out_generated_shape_data = nullptr);
+    shape_inference::DataValueMap* out_generated_shape_data = nullptr,
+    const shape_inference::ModelLocalFunctionsMap& model_local_functions = {});
 
 } // namespace ONNX_NAMESPACE
