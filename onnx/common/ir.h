@@ -172,16 +172,23 @@ struct Attributes {
   Attributes() = default;
 
   void copyAttributes(const Attributes& rhs) {
+    // Bulk attribute replacement -- may gain or lose a g/gs attribute (e.g.
+    // copying an If/Loop node's attributes onto another node), so this
+    // can't unconditionally skip invalidation the way a same-kind set()
+    // does. But it also shouldn't invalidate unconditionally: compare
+    // "had a subgraph attribute before" against "has one after" (via
+    // hasSubgraphAttribute(), cheap -- see its own doc comment) and only
+    // invalidate when that actually flips, exactly like set()/
+    // removeAttribute() below now do for the single-attribute case.
+    const bool had_subgraph_attr = hasSubgraphAttribute();
     values_.clear();
     values_.reserve(rhs.values_.size());
     for (const auto& i : rhs.values_) {
       values_.push_back(i->clone());
     }
-    // Bulk attribute replacement -- may have just gained or lost a g/gs
-    // attribute (e.g. copying an If/Loop node's attributes onto another
-    // node), so this can't skip the same invalidation set()/removeAttribute()
-    // below do. See Graph::invalidateSubgraphNodeCache()'s comment.
-    This()->owningGraph()->invalidateSubgraphNodeCache();
+    if (had_subgraph_attr || hasSubgraphAttribute()) {
+      This()->owningGraph()->invalidateSubgraphNodeCache();
+    }
   }
   bool hasAttribute(Symbol name) const {
     return find(name, false) != values_.end();
@@ -190,8 +197,17 @@ struct Attributes {
     return (*find(name, true))->kind();
   }
   Derived* removeAttribute(Symbol name) {
-    values_.erase(find(name, true));
-    This()->owningGraph()->invalidateSubgraphNodeCache();
+    auto it = find(name, true);
+    // Only a g/gs attribute's removal can change this node's
+    // hasSubgraphAttribute() answer -- see Graph::invalidateSubgraphNodeCache()'s
+    // comment for why invalidating on every attribute removal regardless of
+    // kind (the previous behavior here) made Graph::hasAnySubgraphNode()'s
+    // cache nearly write-only for any graph under active rewriting.
+    const AttributeKind kind = (*it)->kind();
+    values_.erase(it);
+    if (kind == AttributeKind::g || kind == AttributeKind::gs) {
+      This()->owningGraph()->invalidateSubgraphNodeCache();
+    }
     return This();
   }
   bool hasAttributes() const {
@@ -253,12 +269,44 @@ struct Attributes {
   Derived* set(Symbol name, typename T::ConstructorType v) {
     auto it = find(name, false);
     auto nv = std::make_unique<T>(name, std::forward<typename T::ConstructorType>(v));
+    const AttributeKind new_kind = nv->kind();
     if (it == values_.end()) {
       values_.push_back(std::move(nv));
+      // A brand-new attribute can only make hasSubgraphAttribute() flip
+      // from false to true, and only if it's itself g/gs -- adding e.g. an
+      // `axis` int attribute can't turn a node into one that has a
+      // subgraph. Invalidating unconditionally here (the previous
+      // behavior) meant Graph::hasAnySubgraphNode()'s memoized cache
+      // (see its own doc comment) was invalidated by *any* node's *any*
+      // attribute set anywhere in the graph -- e.g. every attribute
+      // onnx-optimizer's own passes set while rewriting -- so the very
+      // next Value::uses()/setUniqueName() call anywhere else in the
+      // graph (both call this on every rename/use-check) paid a full
+      // O(graph size) recompute just to answer "no, there's no If/Loop/
+      // Scan here", the overwhelmingly common answer for a real model.
+      // Confirmed via gperftools profiling: this one recompute path
+      // dominated at 45%+ of total CPU time on a ~21k-node graph under
+      // onnxsim's own fixed-point rewriting.
+      if (new_kind == AttributeKind::g || new_kind == AttributeKind::gs) {
+        This()->owningGraph()->invalidateSubgraphNodeCache();
+      }
     } else {
+      const AttributeKind old_kind = (*it)->kind();
       *it = std::move(nv);
+      // Replacing an attribute can only change this node's
+      // hasSubgraphAttribute() answer if the kind actually changes *and*
+      // one side of that change is g/gs (same-kind replacement, e.g.
+      // swapping an If node's `then_branch` for a different Graph, or
+      // replacing one `axis` int with another, never changes whether this
+      // node has *a* subgraph attribute -- only *which* Graph/value it
+      // holds). See the new-attribute branch above for why this
+      // conditional exists instead of invalidating unconditionally.
+      if (old_kind != new_kind &&
+          (old_kind == AttributeKind::g || old_kind == AttributeKind::gs || new_kind == AttributeKind::g ||
+           new_kind == AttributeKind::gs)) {
+        This()->owningGraph()->invalidateSubgraphNodeCache();
+      }
     }
-    This()->owningGraph()->invalidateSubgraphNodeCache();
     return This();
   }
   template <typename T>
@@ -1107,16 +1155,24 @@ struct Graph final {
   // Called by Attributes<Derived>::set()/removeAttribute()/copyAttributes()
   // (via Node::owningGraph()) whenever a node's attributes change in a way
   // that could add or remove a g/gs (subgraph) attribute -- see
-  // hasAnySubgraphNode()'s comment for what this protects. Conservative: it
-  // fires on any attribute mutation, not just g/gs ones, since attribute
+  // hasAnySubgraphNode()'s comment for what this protects.
+  //
+  // set()/removeAttribute()/copyAttributes() each narrow this to only fire
+  // when a g/gs attribute is actually involved (never skip it when one
+  // *might* have changed -- a stale "no subgraph nodes" cache would make
+  // forSelfAndEachSubGraphImpl silently skip a real subgraph, e.g. losing a
+  // kCaptured value's rename in setUniqueName, not just cost performance).
+  // An earlier version of this function fired unconditionally, on *any*
+  // attribute mutation regardless of kind, on the assumption that attribute
   // mutation is rare relative to the hot paths (Value::uses()/
-  // setUniqueName()/replaceAllUsesWith()) this cache exists to speed up, and
-  // precisely distinguishing g/gs mutations from others isn't worth the
-  // extra coupling between Attributes and Graph. Never skip calling this
-  // when a subgraph attribute *might* have changed -- a stale "no subgraph
-  // nodes" cache would make forSelfAndEachSubGraphImpl silently skip a real
-  // subgraph (e.g. losing a kCaptured value's rename in setUniqueName), not
-  // just cost performance.
+  // setUniqueName()/replaceAllUsesWith()) this cache exists to speed up.
+  // That assumption doesn't hold under active rewriting: onnx-optimizer's
+  // own passes set/remove plenty of non-subgraph attributes per round, each
+  // one invalidating the cache and forcing the next uses()/setUniqueName()
+  // call anywhere in the graph to pay a full O(graph size) recompute just
+  // to reconfirm "no If/Loop/Scan here" -- confirmed via gperftools
+  // profiling to dominate at 45%+ of total CPU time on a ~21k-node graph
+  // under onnxsim's fixed-point rewriting.
   void invalidateSubgraphNodeCache() const {
     subgraph_node_cache_valid_ = false;
   }
