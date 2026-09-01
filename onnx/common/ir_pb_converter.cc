@@ -147,6 +147,35 @@ static Tensor tensorProtoToTensor(ONNX_NAMESPACE::TensorProto& tp) {
   return tensorProtoToTensorGeneric(tp);
 }
 
+// Shared by the const/mutable overloads below, mirroring
+// tensorProtoToTensorGeneric: `values`/`indices` go through the same
+// per-element tensor conversion (including the move-vs-copy raw_data
+// distinction), `dims` is a plain int64 list copy.
+template <typename SparseTensorProtoT>
+static SparseTensor sparseTensorProtoToSparseTensorGeneric(SparseTensorProtoT& stp) {
+  SparseTensor ret;
+  if constexpr (std::is_const_v<SparseTensorProtoT>) {
+    ret.values = tensorProtoToTensor(stp.values());
+    ret.indices = tensorProtoToTensor(stp.indices());
+  } else {
+    ret.values = tensorProtoToTensor(*stp.mutable_values());
+    ret.indices = tensorProtoToTensor(*stp.mutable_indices());
+  }
+  ret.dims.reserve(stp.dims_size());
+  for (int i = 0; i < stp.dims_size(); i++) {
+    ret.dims.push_back(stp.dims(i));
+  }
+  return ret;
+}
+
+static SparseTensor sparseTensorProtoToSparseTensor(const ONNX_NAMESPACE::SparseTensorProto& stp) {
+  return sparseTensorProtoToSparseTensorGeneric(stp);
+}
+
+static SparseTensor sparseTensorProtoToSparseTensor(ONNX_NAMESPACE::SparseTensorProto& stp) {
+  return sparseTensorProtoToSparseTensorGeneric(stp);
+}
+
 static void convertAttribute(const ONNX_NAMESPACE::AttributeProto& ap, Node& n, const int64_t ir_version = IR_VERSION) {
   Symbol sym = Symbol(ap.name());
   switch (ap.type()) {
@@ -223,9 +252,17 @@ static void convertAttribute(const ONNX_NAMESPACE::AttributeProto& ap, Node& n, 
       break;
     }
     case ONNX_NAMESPACE::AttributeProto_AttributeType_SPARSE_TENSOR:
-    case ONNX_NAMESPACE::AttributeProto_AttributeType_SPARSE_TENSORS:
-      fail_convert("Sparse tensors not supported.");
+      n.z_(sym, sparseTensorProtoToSparseTensor(ap.sparse_tensor()));
       break;
+    case ONNX_NAMESPACE::AttributeProto_AttributeType_SPARSE_TENSORS: {
+      std::vector<SparseTensor> sparse_tensors;
+      sparse_tensors.reserve(ap.sparse_tensors_size());
+      for (int i = 0; i < ap.sparse_tensors_size(); i++) {
+        sparse_tensors.emplace_back(sparseTensorProtoToSparseTensor(ap.sparse_tensors(i)));
+      }
+      n.zs_(sym, std::move(sparse_tensors));
+      break;
+    }
     case ONNX_NAMESPACE::AttributeProto_AttributeType_UNDEFINED:
       fail_convert("Unknown tensor data type");
       break;
@@ -358,6 +395,24 @@ static std::unique_ptr<Graph> graphProtoToGraphGeneric(GraphProtoT& gp, bool nes
       // Simply add initializer without creating new value
       // which means it will prioritize input value over initializer value if both exist
       g->addInitializer(init);
+    }
+  }
+
+  // Same before-all-nodes ordering rationale as the dense loop above, and
+  // the same ir_version>=4/name-already-in-input priority rule -- a sparse
+  // initializer's name is its values sub-tensor's name (see
+  // SparseTensor::values's doc comment, tensor.h).
+  for (int i = 0; i < gp.sparse_initializer_size(); ++i) {
+    SparseTensor init;
+    if constexpr (std::is_const_v<GraphProtoT>) {
+      init = sparseTensorProtoToSparseTensor(gp.sparse_initializer(i));
+    } else {
+      init = sparseTensorProtoToSparseTensor(*gp.mutable_sparse_initializer(i));
+    }
+    if (ir_version >= 4 && value_by_name_of.count(init.values.name()) == 0) {
+      value_by_name_of[init.values.name()] = g->addSparseInitializerAndCreateValue(init);
+    } else {
+      g->addSparseInitializer(init);
     }
   }
 
@@ -634,6 +689,24 @@ static void encodeTensor(ONNX_NAMESPACE::TensorProto& p, Tensor& tensor) {
   encodeTensorGeneric(p, tensor);
 }
 
+// Shared by the const/mutable overloads below, mirroring encodeTensorGeneric.
+template <typename SparseTensorT>
+static void encodeSparseTensorGeneric(ONNX_NAMESPACE::SparseTensorProto& p, SparseTensorT& tensor) {
+  encodeTensor(*p.mutable_values(), tensor.values);
+  encodeTensor(*p.mutable_indices(), tensor.indices);
+  for (int64_t d : tensor.dims) {
+    p.add_dims(d);
+  }
+}
+
+void encodeSparseTensor(ONNX_NAMESPACE::SparseTensorProto& p, const SparseTensor& tensor) {
+  encodeSparseTensorGeneric(p, tensor);
+}
+
+static void encodeSparseTensor(ONNX_NAMESPACE::SparseTensorProto& p, SparseTensor& tensor) {
+  encodeSparseTensorGeneric(p, tensor);
+}
+
 void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol name, bool consume_tensor_data) {
   auto* attr = n_p.add_attribute();
   attr->set_name(name.toString());
@@ -675,6 +748,17 @@ void addAttribute(ONNX_NAMESPACE::NodeProto& n_p, const Node& n, Symbol name, bo
       for (const auto& v : n.ts(name)) {
         auto* t = attr->add_tensors();
         encodeTensor(*t, v);
+      }
+    } break;
+    case AttributeKind::z: {
+      attr->set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_SPARSE_TENSOR);
+      encodeSparseTensor(*attr->mutable_sparse_tensor(), n.z(name));
+    } break;
+    case AttributeKind::zs: {
+      attr->set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_SPARSE_TENSORS);
+      for (const auto& v : n.zs(name)) {
+        auto* z = attr->add_sparse_tensors();
+        encodeSparseTensor(*z, v);
       }
     } break;
     case AttributeKind::g: {
@@ -825,6 +909,19 @@ static void encodeGraph(GraphProto& p_g, const std::shared_ptr<Graph>& g, bool c
       // first visit.
       const Tensor& t = *g->initializers()[i];
       encodeTensor(*p, t);
+    }
+  }
+
+  auto num_sparse_initializers = g->sparseInitializers().size();
+  for (unsigned int i = 0; i < num_sparse_initializers; i++) {
+    auto* p = p_g.add_sparse_initializer();
+    if (consume_tensor_data) {
+      encodeSparseTensor(*p, *g->sparseInitializersMutable()[i]);
+    } else {
+      // See the dense-initializer loop above for why this binds through a
+      // named ``const SparseTensor&`` rather than dereferencing inline.
+      const SparseTensor& t = *g->sparseInitializers()[i];
+      encodeSparseTensor(*p, t);
     }
   }
 }

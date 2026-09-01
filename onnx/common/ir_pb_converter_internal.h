@@ -43,4 +43,8 @@ void addAttribute(NodeProto& n_p, const Node& n, Symbol name, bool consume_tenso
 // Defined in ir_pb_converter.cc.
 void encodeTensor(TensorProto& p, const Tensor& tensor);
 
+// Sparse counterpart to encodeTensor above, same copying-only rationale.
+// Defined in ir_pb_converter.cc.
+void encodeSparseTensor(SparseTensorProto& p, const SparseTensor& tensor);
+
 } // namespace ONNX_NAMESPACE

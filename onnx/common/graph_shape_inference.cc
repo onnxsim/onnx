@@ -103,12 +103,40 @@ const Tensor* ConstantDataFor(Value& v, const std::unordered_map<std::string, co
   static const Symbol kValue("value");
 
   const Node* producer = v.node();
+  // hasAttribute() must be checked before kindOf(): kindOf() asserts (throws)
+  // on an attribute the node doesn't have at all, and a Constant node is not
+  // guaranteed to carry `value` specifically -- opset 12+ Constant also
+  // allows sparse_value/value_float/value_floats/value_int/value_ints/
+  // value_string/value_strings, exactly one of which is present.
   if (producer->kind() == kConstant && (!producer->has_domain() || producer->domain().empty()) &&
-      producer->kindOf(kValue) == AttributeKind::t) {
+      producer->hasAttribute(kValue) && producer->kindOf(kValue) == AttributeKind::t) {
     return &producer->t(kValue);
   }
   auto it = initializer_by_name.find(v.uniqueName());
   if (it != initializer_by_name.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
+// Sparse counterpart to ConstantDataFor above: a Constant node's
+// "sparse_value" attribute, or a sparse graph initializer. `sparse_
+// initializer_by_name` is built once per Run(), same amortization
+// rationale as initializer_by_name.
+const SparseTensor* SparseConstantDataFor(
+    Value& v,
+    const std::unordered_map<std::string, const SparseTensor*>& sparse_initializer_by_name) {
+  static const Symbol kConstant("Constant");
+  static const Symbol kSparseValue("sparse_value");
+
+  const Node* producer = v.node();
+  // See ConstantDataFor's own comment on hasAttribute() vs kindOf() ordering.
+  if (producer->kind() == kConstant && (!producer->has_domain() || producer->domain().empty()) &&
+      producer->hasAttribute(kSparseValue) && producer->kindOf(kSparseValue) == AttributeKind::z) {
+    return &producer->z(kSparseValue);
+  }
+  auto it = sparse_initializer_by_name.find(v.uniqueName());
+  if (it != sparse_initializer_by_name.end()) {
     return it->second;
   }
   return nullptr;
@@ -122,6 +150,17 @@ const Tensor* ConstantDataFor(Value& v, const std::unordered_map<std::string, co
 void EncodeShapeOnly(TensorProto& out, const Tensor& t) {
   out.set_data_type(t.elem_type());
   for (int64_t d : t.sizes()) {
+    out.add_dims(d);
+  }
+}
+
+// Sparse counterpart to EncodeShapeOnly above: skips values/indices'
+// contents (gated on their own element count -- see SparseConstantDataFor's
+// caller in ProcessNode's per-input loop -- since those, not `dims`, are
+// what could actually be large), keeping only dtype and the dense shape.
+void EncodeSparseShapeOnly(SparseTensorProto& out, const SparseTensor& t) {
+  out.mutable_values()->set_data_type(t.values.elem_type());
+  for (int64_t d : t.dims) {
     out.add_dims(d);
   }
 }
@@ -175,6 +214,38 @@ void AddAttributeForInference(NodeProto& np, Node& node, Symbol name) {
     attr->set_type(AttributeProto_AttributeType_TENSORS);
     for (const Tensor& t : node.ts(name)) {
       EncodeShapeOnly(*attr->add_tensors(), t);
+    }
+    return;
+  }
+  if (kind == AttributeKind::z) {
+    const SparseTensor& z = node.z(name);
+    if (ElementCountFits(z.values)) {
+      addAttribute(np, node, name, /*consume_tensor_data=*/false);
+      return;
+    }
+    auto* attr = np.add_attribute();
+    attr->set_name(name.toString());
+    attr->set_type(AttributeProto_AttributeType_SPARSE_TENSOR);
+    EncodeSparseShapeOnly(*attr->mutable_sparse_tensor(), z);
+    return;
+  }
+  if (kind == AttributeKind::zs) {
+    bool any_large = false;
+    for (const SparseTensor& z : node.zs(name)) {
+      if (!ElementCountFits(z.values)) {
+        any_large = true;
+        break;
+      }
+    }
+    if (!any_large) {
+      addAttribute(np, node, name, /*consume_tensor_data=*/false);
+      return;
+    }
+    auto* attr = np.add_attribute();
+    attr->set_name(name.toString());
+    attr->set_type(AttributeProto_AttributeType_SPARSE_TENSORS);
+    for (const SparseTensor& z : node.zs(name)) {
+      EncodeSparseShapeOnly(*attr->add_sparse_tensors(), z);
     }
     return;
   }
@@ -271,6 +342,13 @@ class GraphShapeInferenceRunner {
     for (size_t i = 0; i < initializers.size(); ++i) {
       initializer_by_name[initializer_names[i]] = initializers[i].get();
     }
+    std::unordered_map<std::string, const SparseTensor*> sparse_initializer_by_name;
+    const auto& sparse_initializers = g.sparseInitializers();
+    const auto& sparse_initializer_names = g.sparseInitializerNames();
+    sparse_initializer_by_name.reserve(sparse_initializers.size());
+    for (size_t i = 0; i < sparse_initializers.size(); ++i) {
+      sparse_initializer_by_name[sparse_initializer_names[i]] = sparse_initializers[i].get();
+    }
 
     // Whole-graph accumulating type map, mirroring onnx's own protobuf-based
     // InferShapesImpl's "value_types_by_name": used only to resolve an
@@ -342,7 +420,8 @@ class GraphShapeInferenceRunner {
       if (node->kind() == kUndefined || node->kind() == kCaptured) {
         continue;
       }
-      changed |= ProcessNode(*node, opset_imports, registry, initializer_by_name, outer_scope_types);
+      changed |= ProcessNode(
+          *node, opset_imports, registry, initializer_by_name, sparse_initializer_by_name, outer_scope_types);
       for (Value* output : node->outputs()) {
         RecordOuterScopeType(output);
       }
@@ -356,6 +435,7 @@ class GraphShapeInferenceRunner {
       const std::unordered_map<std::string, int>& opset_imports,
       const ISchemaRegistry* registry,
       const std::unordered_map<std::string, const Tensor*>& initializer_by_name,
+      const std::unordered_map<std::string, const SparseTensor*>& sparse_initializer_by_name,
       const std::unordered_map<std::string, TypeProto*>& outer_scope_types) {
     const std::vector<Symbol> attr_names = node.attributeNames();
 
@@ -477,7 +557,10 @@ class GraphShapeInferenceRunner {
         *google::protobuf::Arena::Create<google::protobuf::RepeatedPtrField<TensorProto>>(&arena);
     input_data_storage.Reserve(static_cast<int>(inputs.size()));
     std::unordered_map<std::string, const TensorProto*> input_data_by_name;
-    const std::unordered_map<std::string, const SparseTensorProto*> input_sparse_data_by_name; // always empty (v1)
+    google::protobuf::RepeatedPtrField<SparseTensorProto>& input_sparse_data_storage =
+        *google::protobuf::Arena::Create<google::protobuf::RepeatedPtrField<SparseTensorProto>>(&arena);
+    input_sparse_data_storage.Reserve(static_cast<int>(inputs.size()));
+    std::unordered_map<std::string, const SparseTensorProto*> input_sparse_data_by_name;
 
     for (Value* input : inputs) {
       if (input->node()->kind() == kUndefined) {
@@ -492,6 +575,18 @@ class GraphShapeInferenceRunner {
           TensorProto* tp = input_data_storage.Add();
           encodeTensor(*tp, *data);
           input_data_by_name[input->uniqueName()] = tp;
+        }
+      } else if (const SparseTensor* sparse_data = SparseConstantDataFor(*input, sparse_initializer_by_name)) {
+        // A sparse tensor's `values` sub-tensor holds only its non-default
+        // elements (NNZ), not its full (possibly huge) dense shape -- see
+        // ElementCountFits's own doc comment for why this is the right
+        // thing to gate on, exactly as ConstantDataFor's dense case gates
+        // on the tensor's own element count rather than something derived
+        // from it.
+        if (ElementCountFits(sparse_data->values)) {
+          SparseTensorProto* stp = input_sparse_data_storage.Add();
+          encodeSparseTensor(*stp, *sparse_data);
+          input_sparse_data_by_name[input->uniqueName()] = stp;
         }
       }
     }
