@@ -360,4 +360,20 @@ define_data(int64_t, int64_data_)
 define_data(uint64_t, uint64_data_)
 #undef define_data
 
+// Mirrors SparseTensorProto (onnx.in.proto): `values` and `indices` are
+// themselves ordinary (dense) tensors -- SparseTensorProto's own
+// `values`/`indices` fields are plain TensorProto messages -- so no new leaf
+// representation is needed here, only this wrapper composing two Tensors
+// plus the dense shape they materialize into. `values` must carry a
+// non-empty name (see SparseTensorProto.values's own doc comment): that name
+// is what identifies this SparseTensor when used as a sparse initializer,
+// exactly as Tensor::name() does for a dense one. Plain aggregate with
+// implicitly-generated copy/move: each member (Tensor, Tensor,
+// vector<int64_t>) already has correct value semantics of its own.
+struct SparseTensor final {
+  Tensor values;
+  Tensor indices;
+  std::vector<int64_t> dims;
+};
+
 } // namespace ONNX_NAMESPACE

@@ -384,4 +384,146 @@ TEST(Tensor, ParseDataRawEmpty) {
   EXPECT_TRUE(ParseData<int32_t>(&t).empty());
 }
 
+namespace {
+// Builds a 3x3-dense-shape SparseTensorProto with two non-default float
+// elements at linear indices 0 and 4 (values 1.0 and 2.0) -- the [NNZ]
+// linear-index format SparseTensorProto's own doc comment describes as
+// format (b).
+void FillSparseTensorProto(SparseTensorProto& stp, const std::string& values_name) {
+  stp.mutable_values()->set_name(values_name);
+  stp.mutable_values()->set_data_type(TensorProto_DataType_FLOAT);
+  stp.mutable_values()->add_dims(2);
+  stp.mutable_values()->add_float_data(1.0f);
+  stp.mutable_values()->add_float_data(2.0f);
+  stp.mutable_indices()->set_data_type(TensorProto_DataType_INT64);
+  stp.mutable_indices()->add_dims(2);
+  stp.mutable_indices()->add_int64_data(0);
+  stp.mutable_indices()->add_int64_data(4);
+  stp.add_dims(3);
+  stp.add_dims(3);
+}
+} // namespace
+
+// Sparse tensors used to be entirely unsupported by the C++ Graph IR: a
+// sparse-tensor NODE ATTRIBUTE threw on Import (ir_pb_converter.cc's
+// convertAttribute used to fail_convert("Sparse tensors not supported.")),
+// and a top-level GRAPH INITIALIZER was silently dropped (graphProtoToGraph
+// never read GraphProto.sparse_initializer at all). Regression test for
+// both gaps: a full ModelProto -> Graph -> ModelProto round trip must now
+// preserve a sparse initializer and a Constant node's `sparse_value`
+// attribute exactly.
+TEST(IR, SparseTensorRoundTripsThroughImportExport) {
+  ModelProto model;
+  model.set_ir_version(IR_VERSION);
+  auto* opset = model.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(13);
+
+  GraphProto& gp = *model.mutable_graph();
+  gp.set_name("sparse_test");
+
+  // A sparse graph initializer, consumed by the graph's only output --
+  // exercises Import's addSparseInitializerAndCreateValue path (ir_version
+  // >= 4) and Export's sparse_initializer loop.
+  FillSparseTensorProto(*gp.add_sparse_initializer(), "sparse_init");
+  ValueInfoProto* output = gp.add_output();
+  output->set_name("sparse_init");
+  output->mutable_type()->mutable_sparse_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+
+  // A Constant node whose value is carried as a `sparse_value` attribute --
+  // exercises Import/Export's AttributeKind::z handling.
+  NodeProto* node = gp.add_node();
+  node->set_op_type("Constant");
+  node->add_output("const_out");
+  AttributeProto* attr = node->add_attribute();
+  attr->set_name("sparse_value");
+  attr->set_type(AttributeProto_AttributeType_SPARSE_TENSOR);
+  FillSparseTensorProto(*attr->mutable_sparse_tensor(), "const_sparse_value");
+  ValueInfoProto* node_output = gp.add_output();
+  node_output->set_name("const_out");
+  node_output->mutable_type()->mutable_sparse_tensor_type()->set_elem_type(TensorProto_DataType_FLOAT);
+
+  std::shared_ptr<Graph> g(ImportModelProto(model));
+  // Not ASSERT_NE(g, nullptr): gtest's failure-message printer for
+  // shared_ptr<Graph> requires an operator<<(ostream&, const Graph&),
+  // which ir.h does not define.
+  ASSERT_TRUE(g != nullptr);
+
+  // Graph-side: the sparse initializer is queryable by name, and its
+  // content matches what was fed in.
+  const SparseTensor* init = g->getSparseInitializer("sparse_init");
+  ASSERT_NE(init, nullptr);
+  EXPECT_EQ(init->values.elem_type(), TensorProto_DataType_FLOAT);
+  EXPECT_EQ(init->indices.elem_type(), TensorProto_DataType_INT64);
+  EXPECT_EQ(init->dims, (std::vector<int64_t>{3, 3}));
+  ASSERT_EQ(init->values.floats().size(), 2u);
+  EXPECT_FLOAT_EQ(init->values.floats()[0], 1.0f);
+  EXPECT_FLOAT_EQ(init->values.floats()[1], 2.0f);
+  ASSERT_EQ(init->indices.int64s().size(), 2u);
+  EXPECT_EQ(init->indices.int64s()[0], 0);
+  EXPECT_EQ(init->indices.int64s()[1], 4);
+
+  // A Value was also registered for the sparse initializer (ir_version >= 4).
+  bool found_initializer_value = false;
+  for (Value* out : g->outputs()) {
+    if (out->uniqueName() == "sparse_init") {
+      found_initializer_value = true;
+    }
+  }
+  EXPECT_TRUE(found_initializer_value);
+
+  // The Constant node's sparse_value attribute round-tripped too.
+  Node* const_node = nullptr;
+  for (Node* n : g->nodes()) {
+    if (n->kind().toString() == std::string("Constant")) {
+      const_node = n;
+    }
+  }
+  ASSERT_NE(const_node, nullptr);
+  ASSERT_EQ(const_node->kindOf(Symbol("sparse_value")), AttributeKind::z);
+  const SparseTensor& node_sparse = const_node->z(Symbol("sparse_value"));
+  EXPECT_EQ(node_sparse.dims, (std::vector<int64_t>{3, 3}));
+  ASSERT_EQ(node_sparse.values.floats().size(), 2u);
+  EXPECT_FLOAT_EQ(node_sparse.values.floats()[0], 1.0f);
+  EXPECT_FLOAT_EQ(node_sparse.values.floats()[1], 2.0f);
+
+  // Export back and check the round trip is faithful at the protobuf level
+  // too.
+  ModelProto exported;
+  ExportModelProto(&exported, g);
+
+  ASSERT_EQ(exported.graph().sparse_initializer_size(), 1);
+  const SparseTensorProto& exported_init = exported.graph().sparse_initializer(0);
+  EXPECT_EQ(exported_init.values().name(), "sparse_init");
+  EXPECT_EQ(exported_init.values().data_type(), TensorProto_DataType_FLOAT);
+  ASSERT_EQ(exported_init.values().float_data_size(), 2);
+  EXPECT_FLOAT_EQ(exported_init.values().float_data(0), 1.0f);
+  EXPECT_FLOAT_EQ(exported_init.values().float_data(1), 2.0f);
+  ASSERT_EQ(exported_init.indices().int64_data_size(), 2);
+  EXPECT_EQ(exported_init.indices().int64_data(0), 0);
+  EXPECT_EQ(exported_init.indices().int64_data(1), 4);
+  EXPECT_EQ(exported_init.dims_size(), 2);
+  EXPECT_EQ(exported_init.dims(0), 3);
+  EXPECT_EQ(exported_init.dims(1), 3);
+
+  bool found_sparse_attr = false;
+  for (const auto& exported_node : exported.graph().node()) {
+    if (exported_node.op_type() != "Constant") {
+      continue;
+    }
+    for (const auto& exported_attr : exported_node.attribute()) {
+      if (exported_attr.name() != "sparse_value") {
+        continue;
+      }
+      found_sparse_attr = true;
+      EXPECT_EQ(exported_attr.type(), AttributeProto_AttributeType_SPARSE_TENSOR);
+      EXPECT_EQ(exported_attr.sparse_tensor().values().name(), "const_sparse_value");
+      ASSERT_EQ(exported_attr.sparse_tensor().values().float_data_size(), 2);
+      EXPECT_FLOAT_EQ(exported_attr.sparse_tensor().values().float_data(0), 1.0f);
+      EXPECT_FLOAT_EQ(exported_attr.sparse_tensor().values().float_data(1), 2.0f);
+    }
+  }
+  EXPECT_TRUE(found_sparse_attr);
+}
+
 } // namespace ONNX_NAMESPACE::Test
