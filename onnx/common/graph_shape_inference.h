@@ -56,14 +56,19 @@ namespace ONNX_NAMESPACE {
 // one function of computation" framing), so a caller whose node references
 // one must pass it in explicitly; omit it (the default, empty) if the
 // model has none, or if the caller doesn't have it on hand -- exactly as if
-// that particular function were undefined (see the v1-scope note below,
-// same safe fallback).
+// that particular function were undefined: safe, an affected node's outputs
+// are simply left as they were, exactly as if the op had no registered
+// schema (onnx's own protobuf-based InferShapes does the same for a
+// genuinely unknown op), never producing incorrect information.
 //
-// v1 scope -- these remaining limitations are all *safe*: an affected
-// node's outputs are simply left as they were, exactly as if the op had no
-// registered schema (onnx's own protobuf-based InferShapes does the same
-// for a genuinely unknown op), never producing incorrect information:
-//  - Sparse tensor inputs are not fed to getInputSparseData().
+// Sparse tensor inputs ARE fed to getInputSparseData(): a sparse graph
+// initializer or a Constant node's `sparse_value` attribute (both held as
+// ir.h's own SparseTensor -- see tensor.h) is encoded into a
+// SparseTensorProto on the fly for the visited node's InferenceContextImpl,
+// mirroring ConstantDataFor's dense-tensor handling exactly, including its
+// size gate (SparseTensor::values holds only the non-default/NNZ elements,
+// so that -- not the possibly-huge dense `dims` -- is what gets gated on;
+// see SparseConstantDataFor and its call site in ProcessNode).
 //
 // Returns whether any value's inferred type/shape actually changed
 // anything, mirroring ONNX_NAMESPACE::shape_inference::InferShapes's

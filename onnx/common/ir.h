@@ -80,7 +80,8 @@ struct Dimension final {
 
 enum class AttributeKind : uint8_t {
   // float, float list, int, int list, string, string list,
-  // tensor, tensor list, subgraph, subgraph list. type proto, type proto list
+  // tensor, tensor list, sparse tensor, sparse tensor list, subgraph,
+  // subgraph list, type proto, type proto list
   f,
   fs,
   i,
@@ -89,6 +90,8 @@ enum class AttributeKind : uint8_t {
   ss,
   t,
   ts,
+  z,
+  zs,
   g,
   gs,
   tp,
@@ -97,7 +100,8 @@ enum class AttributeKind : uint8_t {
 
 static inline const char* toString(AttributeKind kind) {
   // NOLINTNEXTLINE(modernize-avoid-c-arrays)
-  static constexpr const char* names[] = {"f", "fs", "i", "is", "s", "ss", "t", "ts", "g", "gs", "tp", "tps"};
+  static constexpr const char* names[] = {
+      "f", "fs", "i", "is", "s", "ss", "t", "ts", "z", "zs", "g", "gs", "tp", "tps"};
   ONNX_ASSERT(size_t(kind) < std::size(names))
   return names[static_cast<int>(kind)];
 }
@@ -157,6 +161,8 @@ using StringAttr = ScalarAttributeValue<std::string, AttributeKind::s>;
 using StringsAttr = VectorAttributeValue<std::string, AttributeKind::ss>;
 using TensorAttr = ScalarAttributeValue<Tensor, AttributeKind::t>;
 using TensorsAttr = VectorAttributeValue<Tensor, AttributeKind::ts>;
+using SparseTensorAttr = ScalarAttributeValue<SparseTensor, AttributeKind::z>;
+using SparseTensorsAttr = VectorAttributeValue<SparseTensor, AttributeKind::zs>;
 using GraphAttr = ScalarAttributeValue<std::shared_ptr<Graph>, AttributeKind::g>;
 using GraphsAttr = VectorAttributeValue<std::shared_ptr<Graph>, AttributeKind::gs>;
 using TypeProtoAttr = ScalarAttributeValue<TypeProto, AttributeKind::tp>;
@@ -254,6 +260,8 @@ struct Attributes {
   CREATE_ACCESSOR(Ints, is)
   CREATE_ACCESSOR(Tensor, t)
   CREATE_ACCESSOR(Tensors, ts)
+  CREATE_ACCESSOR(SparseTensor, z)
+  CREATE_ACCESSOR(SparseTensors, zs)
   CREATE_ACCESSOR(Graph, g)
   CREATE_ACCESSOR(Graphs, gs)
   CREATE_ACCESSOR(TypeProto, tp)
@@ -1076,6 +1084,17 @@ struct Graph final {
   std::vector<std::unique_ptr<Tensor>> initializers_;
   std::vector<std::string> initializer_names_;
 
+  // Sparse counterpart to initializers_/initializer_names_ above, same
+  // heap-allocated-per-element rationale (a SparseTensor's address must stay
+  // stable across insertion/erasure elsewhere in the vector). A sparse
+  // initializer's "name" is its values sub-tensor's name (see
+  // SparseTensor's own doc comment in tensor.h), mirrored into
+  // sparse_initializer_names_ exactly as initializer_names_ mirrors each
+  // Tensor's name -- so isNameUnique()'s used_names_ lookup and
+  // collectAllNames() both need to know about this list too.
+  std::vector<std::unique_ptr<SparseTensor>> sparse_initializers_;
+  std::vector<std::string> sparse_initializer_names_;
+
   bool has_name_{false};
   std::string name_;
   bool has_doc_string_{false};
@@ -1129,6 +1148,7 @@ struct Graph final {
   // names instead of once per name.
   void collectAllNames(std::unordered_set<std::string>& out) const {
     out.insert(initializer_names_.cbegin(), initializer_names_.cend());
+    out.insert(sparse_initializer_names_.cbegin(), sparse_initializer_names_.cend());
     for (const auto& node_entry : all_nodes) {
       const Node* node = node_entry.first;
       for (const auto& attr : node->attributeNames()) {
@@ -1251,6 +1271,100 @@ struct Graph final {
     useName(initializer_names_.back());
     initializers_.push_back(std::make_unique<Tensor>(std::move(initializer)));
     return init_value;
+  }
+
+  // Sparse counterparts to addInitializer/addInitializerAndCreateValue above.
+  // A sparse initializer's name lives on its values sub-tensor (see
+  // SparseTensor's doc comment in tensor.h) rather than a field of its own,
+  // so every place addInitializer reads/sets initializer.name() reads/sets
+  // initializer.values.name() here instead.
+  void addSparseInitializer(SparseTensor& initializer) {
+    if (initializer.values.name().empty()) {
+      initializer.values.setName(getNextUniqueName());
+    }
+    sparse_initializers_.push_back(std::make_unique<SparseTensor>(initializer));
+    sparse_initializer_names_.push_back(initializer.values.name());
+    useName(initializer.values.name());
+  }
+
+  // Move-taking overload, same rationale as addInitializer(Tensor&&): skips
+  // copying values/indices' raw_data for a caller discarding its
+  // SparseTensor right after this call.
+  void addSparseInitializer(SparseTensor&& initializer) {
+    if (initializer.values.name().empty()) {
+      initializer.values.setName(getNextUniqueName());
+    }
+    sparse_initializer_names_.push_back(initializer.values.name());
+    useName(sparse_initializer_names_.back());
+    sparse_initializers_.push_back(std::make_unique<SparseTensor>(std::move(initializer)));
+  }
+
+  // For IR >= 4, mirrors addInitializerAndCreateValue: also registers a
+  // graph Value for the sparse initializer, typed via TypeProto's
+  // sparse_tensor_type -- unlike a dense initializer's Value (plain
+  // elemType()/sizes()), a sparse one's shape/dtype can't be expressed
+  // through Value's tensor-type fast path (see EncodeCurrentType in
+  // graph_shape_inference.cc and encodeValueInfo in ir_pb_converter.cc,
+  // both of which fall back to the generic v.type() TypeProto for anything
+  // that isn't a plain dense tensor).
+  Value* addSparseInitializerAndCreateValue(SparseTensor& initializer) {
+    addSparseInitializer(initializer);
+    auto* init_value = initializer_node_->addOutput();
+    init_value->setUniqueName(initializer.values.name());
+    auto type = std::make_unique<TypeProto>();
+    auto* sparse_type = type->mutable_sparse_tensor_type();
+    sparse_type->set_elem_type(initializer.values.elem_type());
+    auto* shape = sparse_type->mutable_shape();
+    for (int64_t d : initializer.dims) {
+      shape->add_dim()->set_dim_value(d);
+    }
+    init_value->type() = std::move(type);
+    return init_value;
+  }
+
+  void eraseSparseInitializer(const std::string& name) {
+    sparse_initializers_.erase(
+        std::remove_if(
+            sparse_initializers_.begin(),
+            sparse_initializers_.end(),
+            [&name](const std::unique_ptr<SparseTensor>& initializer) { return initializer->values.name() == name; }),
+        sparse_initializers_.end());
+    sparse_initializer_names_.erase(
+        std::remove(sparse_initializer_names_.begin(), sparse_initializer_names_.end(), name),
+        sparse_initializer_names_.end());
+    releaseName(name);
+    for (size_t i = 0; i < initializer_node_->outputs().size(); i++) {
+      if (initializer_node_->outputs()[i]->uniqueName() == name) {
+        initializer_node_->eraseOutput(i);
+        break;
+      }
+    }
+  }
+  void clearSparseInitializers() {
+    for (const auto& name : sparse_initializer_names_) {
+      releaseName(name);
+    }
+    sparse_initializers_.clear();
+    sparse_initializer_names_.clear();
+  }
+  const std::vector<std::unique_ptr<SparseTensor>>& sparseInitializers() const {
+    return sparse_initializers_;
+  }
+  // Mutable access, used by the ir_pb_converter's "consuming" Export path;
+  // see initializers_mutable()'s own doc comment for the same rationale.
+  std::vector<std::unique_ptr<SparseTensor>>& sparseInitializersMutable() {
+    return sparse_initializers_;
+  }
+  const std::vector<std::string>& sparseInitializerNames() const {
+    return sparse_initializer_names_;
+  }
+  const SparseTensor* getSparseInitializer(const std::string& name) const {
+    for (const auto& initializer : sparse_initializers_) {
+      if (name == initializer->values.name()) {
+        return initializer.get();
+      }
+    }
+    return nullptr;
   }
 
   void eraseInitializer(const std::string& name) {
@@ -1715,6 +1829,15 @@ inline Value* Value::setUniqueName(const std::string& name, bool update_related_
         // independent of this Value's own registration below -- see
         // used_names_'s comment for why the same name can have more than
         // one live holder at once.
+        graph->releaseName(old_name);
+        graph->useName(name);
+      }
+    }
+    for (size_t i = 0; i < owningGraph()->sparse_initializer_names_.size(); i++) {
+      auto& sparse_initializer_name = owningGraph()->sparse_initializer_names_[i];
+      if (sparse_initializer_name == old_name) {
+        sparse_initializer_name = name;
+        owningGraph()->sparse_initializers_[i]->values.setName(name);
         graph->releaseName(old_name);
         graph->useName(name);
       }
