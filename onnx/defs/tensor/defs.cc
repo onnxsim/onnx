@@ -3538,6 +3538,57 @@ ONNX_OPERATOR_SET_SCHEMA(
             1,
             OpSchema::Differentiable)
         .TypeConstraint("T", OpSchema::all_tensor_types_ir12(), "Constrain input and output types to any tensor type.")
+        // Decomposes into ScatterElements: every coordinate but the one
+        // along `axis` is an identity copy, and `axis`'s own coordinate is
+        // driven by a same-shape-as-`update` index tensor -- exactly
+        // ScatterElements' own contract, with that index tensor computed as
+        // `write_indices[batch] + axis_coord`, wrapped modulo
+        // `max_sequence_length`. That wrap is unconditional (not gated on
+        // `mode`): per "linear" mode's own documented precondition
+        // (`write_indices + sequence_length <= max_sequence_length`), every
+        // index it produces is already in `[0, max_sequence_length)`, so the
+        // `Mod` is a no-op there and the real wraparound only for
+        // "circular" -- one function body needs no `mode`-dependent
+        // branching (which a static function body has no way to express
+        // anyway, since `mode`'s actual value isn't known until each call
+        // site, only threaded through symbolically). Note this body always
+        // reads `write_indices`, so it only applies to a 3-input call site;
+        // a 2-input call (the default-all-zero `write_indices` case) has no
+        // matching function body here.
+        .FunctionBody(R"ONNX(
+        {
+            UpdateShape = Shape (update)
+            Rank = Size (UpdateShape)
+            Zero = Constant <value_int: int = 0> ()
+            One = Constant <value_int: int = 1> ()
+            Positions = Range (Zero, Rank, One)
+
+            AxisAttr = Constant <value_int: int = @axis> ()
+            AxisMod = Mod (AxisAttr, Rank)
+            AxisShifted = Add (AxisMod, Rank)
+            AxisNorm = Mod (AxisShifted, Rank)
+
+            SeqLen = Gather <axis = 0> (UpdateShape, AxisNorm)
+            AxisIota = Range (Zero, SeqLen, One)
+
+            NegOne = Constant <value_int: int = -1> ()
+            IsAxisPos = Equal (Positions, AxisNorm)
+            IotaReshapeShape = Where (IsAxisPos, NegOne, One)
+            AxisIndices = Reshape (AxisIota, IotaReshapeShape)
+
+            IsBatchPos = Equal (Positions, Zero)
+            WiReshapeShape = Where (IsBatchPos, NegOne, One)
+            WiReshaped = Reshape (write_indices, WiReshapeShape)
+            CombinedIndices = Add (WiReshaped, AxisIndices)
+
+            PastCacheShape = Shape (past_cache)
+            MaxSeq = Gather <axis = 0> (PastCacheShape, AxisNorm)
+            WrappedIndices = Mod (CombinedIndices, MaxSeq)
+
+            FinalIndices = Expand (WrappedIndices, UpdateShape)
+            present_cache = ScatterElements <axis: int = @axis> (past_cache, FinalIndices, update)
+        }
+        )ONNX")
         .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
           propagateElemTypeFromInputToOutput(ctx, 0, 0);
 
