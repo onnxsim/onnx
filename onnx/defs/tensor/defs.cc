@@ -3555,6 +3555,73 @@ ONNX_OPERATOR_SET_SCHEMA(
         // reads `write_indices`, so it only applies to a 3-input call site;
         // a 2-input call (the default-all-zero `write_indices` case) has no
         // matching function body here.
+        //
+        // The node sequence below was hand-simplified (redundant CastLike/
+        // duplicate-Constant nodes onnxscript conservatively inserts were
+        // dropped, since e.g. `Constant <value_int: int = ...>` already
+        // produces an int64 scalar matching every consumer here) from this
+        // onnxscript function, which is the original, mechanically-verified
+        // source (see also the FunctionBody's own opset_import: 18, matching
+        // the `opset18` import below -- 24 only for `TensorScatter` itself):
+        //
+        //   from onnxscript import INT64, FLOAT, script, values
+        //   from onnxscript import opset18 as op
+        //
+        //   onnxsim_domain = values.Opset(domain="onnxsim.functions", version=1)
+        //
+        //   @script(onnxsim_domain)
+        //   def TensorScatterToScatterElements(
+        //       past_cache: FLOAT["batch", "..."],
+        //       update: FLOAT["batch", "..."],
+        //       write_indices: INT64["batch"],
+        //       axis: int,
+        //   ) -> FLOAT["batch", "..."]:
+        //       update_shape = op.Shape(update)
+        //       rank = op.Size(update_shape)
+        //       positions = op.Range(0, rank, 1)
+        //
+        //       # Normalize a possibly-negative `axis` attribute into [0, rank).
+        //       axis_norm = op.Mod(op.Add(op.Mod(axis, rank), rank), rank)
+        //
+        //       # seq_len = update's own size along axis; axis_iota = [0, 1, ..., seq_len-1]
+        //       # (sequence_idx for every position along axis).
+        //       seq_len = op.Gather(update_shape, axis_norm, axis=0)
+        //       axis_iota = op.Range(0, seq_len, 1)
+        //
+        //       # Reshape axis_iota to rank `rank` with seq_len at position axis_norm and
+        //       # 1 elsewhere -- built dynamically via a positional mask, not a static
+        //       # literal, so no compile-time-known rank is required.
+        //       iota_reshape_shape = op.Where(op.Equal(positions, axis_norm), -1, 1)
+        //       indices = op.Reshape(axis_iota, iota_reshape_shape)
+        //
+        //       # Fold in write_indices: reshape to rank `rank` with its own length at
+        //       # position 0 (the batch axis is always position 0) and 1 elsewhere, then
+        //       # broadcast-add.
+        //       wi_reshape_shape = op.Where(op.Equal(positions, 0), -1, 1)
+        //       wi_reshaped = op.Reshape(write_indices, wi_reshape_shape)
+        //       indices = op.Add(wi_reshaped, indices)
+        //
+        //       # Wrap modulo max_sequence_length -- a no-op for valid "linear"-mode
+        //       # inputs (see this schema's own comment above), the intended wraparound
+        //       # for "circular".
+        //       max_seq = op.Gather(op.Shape(past_cache), axis_norm, axis=0)
+        //       indices = op.Mod(indices, max_seq)
+        //
+        //       # Broadcast out to update's exact shape -- ScatterElements requires
+        //       # indices/updates to have identical shapes.
+        //       final_indices = op.Expand(indices, update_shape)
+        //
+        //       return op.ScatterElements(past_cache, final_indices, update, axis=axis)
+        //
+        // `TensorScatterToScatterElements.to_function_proto()` followed by
+        // `onnx.printer.to_text(...)` on that FunctionProto produces the same
+        // computation as the FunctionBody text below, aside from the
+        // `onnxsim.functions` domain, the `return_val`/`present_cache` output
+        // name, and the CastLike/duplicate-Constant bloat mentioned above.
+        // Verified numerically against this op's own reference kernel
+        // (`onnx/reference/ops/op_tensor_scatter.py`) across rank-2/rank-3,
+        // positive/negative `axis`, and a genuine `mode="circular"`
+        // wraparound -- all matched exactly.
         .FunctionBody(R"ONNX(
         {
             UpdateShape = Shape (update)
