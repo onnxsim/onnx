@@ -44,7 +44,8 @@ struct CapturedTensorScope {
 void PropagateCapturedTensorTypes(const std::shared_ptr<Graph>& graph, const CapturedTensorScope* outer_scope) {
   assertNonNull(graph);
   CapturedTensorScope scope{outer_scope, {}};
-  for (const auto& initializer : graph->initializers()) {
+  for (const auto& initializer_ptr : graph->initializers()) {
+    const Tensor& initializer = *initializer_ptr;
     scope.values[initializer.name()] = {
         initializer.elem_type(), true, {initializer.sizes().begin(), initializer.sizes().end()}};
   }
@@ -274,7 +275,11 @@ ModelProto DefaultVersionConverter::convert_version(
     const OpSetID& target_version) const {
   const std::string& initial_domain = initial_version.domain();
   const std::string& target_domain = target_version.domain();
-  assertDefaultDomain(initial_domain, target_domain);
+  ONNX_ASSERTM(
+      (initial_domain.empty() || initial_domain == "ai.onnx") && (target_domain.empty() || target_domain == "ai.onnx"),
+      "Warning: default onnx version converter can only convert "
+      " between default domain opset versions ('' or 'ai.onnx')\n")
+  ONNX_ASSERTM(initial_domain == target_domain, "initial_version and target_version must have the same domains")
 
   for (auto it = mp_in.opset_import().begin(); it != mp_in.opset_import().end(); ++it) {
     if (it->domain() == initial_version.domain()) {
