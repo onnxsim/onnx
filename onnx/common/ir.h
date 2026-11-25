@@ -324,6 +324,9 @@ struct Value final {
   std::string unique_name_;
   bool has_doc_string_{false};
   std::string doc_string_;
+  // ValueInfoProto.metadata_props, carried through the IR round trip so
+  // graph inputs/outputs/value_info keep their key/value annotations.
+  std::vector<StringStringEntryProto> metadata_props_;
   int32_t elem_type_{ONNX_NAMESPACE::TensorProto_DataType_UNDEFINED};
   bool has_sizes_{false};
   std::vector<Dimension> sizes_;
@@ -374,6 +377,13 @@ struct Value final {
   Value* setDocString(std::string doc_string) {
     has_doc_string_ = true;
     doc_string_ = std::move(doc_string);
+    return this;
+  }
+  const std::vector<StringStringEntryProto>& metadataProps() const {
+    return metadata_props_;
+  }
+  Value* setMetadataProps(std::vector<StringStringEntryProto> props) {
+    metadata_props_ = std::move(props);
     return this;
   }
   Value* setStage(size_t s) {
@@ -428,6 +438,7 @@ struct Value final {
     if (from->has_doc_string()) {
       setDocString(from->docString());
     }
+    setMetadataProps(from->metadataProps());
     return this;
   }
 

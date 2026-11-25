@@ -298,6 +298,7 @@ std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, b
     if (vip.has_doc_string()) {
       v->setDocString(vip.doc_string());
     }
+    v->setMetadataProps({vip.metadata_props().begin(), vip.metadata_props().end()});
     v->setUniqueName(vip.name());
     value_by_name_of[vip.name()] = v;
   }
@@ -396,6 +397,7 @@ std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, b
     if (output.has_doc_string()) {
       output_value->setDocString(output.doc_string());
     }
+    output_value->setMetadataProps({output.metadata_props().begin(), output.metadata_props().end()});
     g->registerOutput(output_value);
   }
 
@@ -419,6 +421,7 @@ std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, b
     if (gp.value_info(i).has_doc_string()) {
       v->setDocString(gp.value_info(i).doc_string());
     }
+    v->setMetadataProps({gp.value_info(i).metadata_props().begin(), gp.value_info(i).metadata_props().end()});
   }
 
   return g;
@@ -639,6 +642,9 @@ static void encodeValueInfo(ONNX_NAMESPACE::ValueInfoProto& v, Value& n) {
   }
   if (n.has_doc_string()) {
     v.set_doc_string(n.docString());
+  }
+  for (const auto& prop : n.metadataProps()) {
+    v.add_metadata_props()->CopyFrom(prop);
   }
 }
 
